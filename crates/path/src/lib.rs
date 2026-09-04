@@ -203,6 +203,17 @@ pub enum LineJoin {
     /// The bevel shape is a triangle that fills the area between the two stroked
     /// segments.
     Bevel,
+    /// Extend the outer stroke edges with arcs derived from endpoint curvature.
+    ///
+    /// See the [SVG 2 join construction](https://www.w3.org/TR/2018/CR-SVG2-20181004/painting.html#LineJoinShape).
+    Arcs,
+    /// Same as [`Arcs`](Self::Arcs), with tangent-continuous rounding of miter-limit cuts.
+    ///
+    /// The rounded tip follows the cut-edge directions, so it is not necessarily
+    /// a semicircle and may extend beyond the miter limit. Invalid or non-convex
+    /// fits keep the flat cut. Unclipped joins and round fallbacks are unchanged.
+    /// This is a Lyon extension, not SVG behavior, and is independent of line caps.
+    ArcsRound,
 }
 
 /// The positive or negative side of a vector or segment.
