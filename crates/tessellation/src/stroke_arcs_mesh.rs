@@ -121,6 +121,36 @@ struct MeshLayout {
 }
 
 impl ArcsMesh {
+    /// Include the inner stroke attachment when a cut removes part of the bevel.
+    /// Closing only the two outer attachments would refill that removed area.
+    pub(crate) fn tessellate_with_inner_vertex(
+        &mut self,
+        join: &ResolvedArcsJoin,
+        tolerance: f64,
+        inner: Point64,
+    ) -> Result<(), ArcsMeshError> {
+        self.clear_buffers();
+        if !point_is_finite(inner) {
+            return Err(ArcsMeshError::InvalidBoundary { segment: "inner" });
+        }
+        let layout = prepare_mesh_layout::<true>(join, tolerance)?;
+        if layout.vertex_count >= MAX_VERTEX_COUNT {
+            return Err(ArcsMeshError::TooManyVertices {
+                limit: MAX_VERTEX_COUNT,
+            });
+        }
+        self.reserve_triangulation_buffers(layout.vertex_count + 1)?;
+        self.append_layout_vertices::<true>(layout);
+        self.vertices.push(inner);
+        triangulate_polygon_general(
+            &mut self.indices,
+            &self.vertices,
+            &mut self.remaining,
+            &[layout.vertex_count],
+        )
+        .map(|_| ())
+    }
+
     pub(crate) fn tessellate(
         &mut self,
         join: &ResolvedArcsJoin,

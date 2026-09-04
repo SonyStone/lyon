@@ -22,8 +22,8 @@ use crate::{
     TessellationError, TessellationResult, VertexId, VertexSource,
 };
 
-use core::f32::consts::PI;
 use alloc::vec::Vec;
+use core::f32::consts::PI;
 
 #[cfg(not(feature = "std"))]
 use num_traits::Float;
@@ -850,6 +850,11 @@ impl<'l, Output: StrokeGeometryBuilder + ?Sized> StrokeBuilderImpl<'l, Output> {
         if matches!(join, LineJoin::Arcs | LineJoin::ArcsRound) && !self.arcs_differentials_enabled
         {
             self.arcs.reset_differentials(self.point_buffer.count());
+            // The contour may already have saved its first two points for closing.
+            // Their curvature was not recorded before arcs tracking was enabled.
+            for _ in 0..self.firsts.len() {
+                self.arcs.firsts.push(EndpointDifferentials::default());
+            }
             self.arcs_differentials_enabled = true;
         }
         self.options.line_join = join;
@@ -2467,6 +2472,39 @@ fn tessellate_join(
         }
     }
 
+    if let Some(PreparedArcsJoin::Curved(resolved)) = arcs_join {
+        if resolved.clips_radial_edge()
+            && emit_mixed_arcs_clip(
+                join,
+                resolved,
+                options,
+                arcs_mesh,
+                arcs_vertex_ids,
+                vertex,
+                attributes,
+                output,
+            )?
+        {
+            if requested_join == LineJoin::ArcsRound {
+                if let Some([a, b]) = resolved.clip_endpoints() {
+                    if let [Ok(a), Ok(b)] = [point64_to_point(a), point64_to_point(b)] {
+                        round_clip::emit(
+                            join,
+                            [a, b],
+                            resolved.clip_tangents(),
+                            arcs_outer_side(resolved.turn()),
+                            options.tolerance,
+                            vertex,
+                            attributes,
+                            output,
+                        )?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+    }
+
     let side_needs_join = [
         join.side_points[SIDE_POSITIVE].single_vertex.is_none() && !join.fold[SIDE_NEGATIVE],
         join.side_points[SIDE_NEGATIVE].single_vertex.is_none() && !join.fold[SIDE_POSITIVE],
@@ -2666,6 +2704,71 @@ fn emit_radial_arcs_clip(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn emit_mixed_arcs_clip(
+    join: &EndpointData,
+    resolved: &ResolvedArcsJoin,
+    options: &StrokeOptions,
+    mesh: &mut ArcsMesh,
+    vertex_ids: &mut Vec<VertexId>,
+    vertex: &mut StrokeVertexData,
+    attributes: &dyn AttributeStore,
+    output: &mut (impl StrokeGeometryBuilder + ?Sized),
+) -> Result<bool, TessellationError> {
+    let side = arcs_outer_side(resolved.turn());
+    let inner_side = 1 - side;
+    let Some(inner_position) = join.side_points[inner_side].single_vertex else {
+        return Ok(false);
+    };
+    if join.fold[side] || join.fold[inner_side] {
+        return Ok(false);
+    }
+    if mesh
+        .tessellate_with_inner_vertex(
+            resolved,
+            f64::from(options.tolerance),
+            Point64::new(f64::from(inner_position.x), f64::from(inner_position.y)),
+        )
+        .is_err()
+    {
+        return Ok(false);
+    }
+
+    // The contour ends with the existing outgoing attachment and inner vertex.
+    // Validate before emitting anything so a failed conversion can fall back.
+    let vertices = mesh.vertices();
+    let middle = &vertices[1..vertices.len() - 2];
+    for p in middle {
+        if point64_to_point(*p).is_err() {
+            return Ok(false);
+        }
+    }
+    vertex_ids.clear();
+    vertex_ids.reserve(vertices.len());
+    vertex_ids.push(join.side_points[side].prev_vertex);
+    vertex.position_on_path = join.position;
+    vertex.half_width = join.half_width;
+    vertex.side = if side == SIDE_POSITIVE {
+        Side::Positive
+    } else {
+        Side::Negative
+    };
+    for p in middle {
+        vertex.normal = (point(p.x as f32, p.y as f32) - join.position) / join.half_width;
+        vertex_ids.push(output.add_stroke_vertex(StrokeVertex(vertex, attributes))?);
+    }
+    vertex_ids.push(join.side_points[side].next_vertex);
+    vertex_ids.push(join.side_points[inner_side].prev_vertex);
+    for triangle in mesh.indices().chunks_exact(3) {
+        output.add_triangle(
+            vertex_ids[triangle[0]],
+            vertex_ids[triangle[2]],
+            vertex_ids[triangle[1]],
+        );
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_arcs_join(
     join: &EndpointData,
     resolved: &ResolvedArcsJoin,
@@ -2677,6 +2780,10 @@ fn emit_arcs_join(
     attributes: &dyn AttributeStore,
     output: &mut (impl StrokeGeometryBuilder + ?Sized),
 ) -> Result<bool, TessellationError> {
+    if resolved.clips_radial_edge() {
+        // Mixed clips need the full inner contour, handled before bevel fill.
+        return Ok(false);
+    }
     let tessellation = match mesh.tessellate_for_output(resolved, f64::from(options.tolerance)) {
         Ok(tessellation) => tessellation,
         Err(_) => return Ok(false),
@@ -4099,6 +4206,74 @@ fn arcs_join_emits_radial_clips_for_sub_unit_miter_limits() {
         );
         let clipped_corner = point(11.5, -outgoing_y.signum() * 1.5);
         assert!(!mesh_contains_point(&buffers, clipped_corner));
+    }
+}
+
+#[test]
+fn arcs_join_emits_mixed_support_and_radial_clips() {
+    for mirror in [-1.0_f32, 1.0] {
+        for reverse in [false, true] {
+            for tolerance in [0.001, 0.25] {
+                let p = |x, y| point(x, y * mirror);
+                let start = p(-40.0, -60.0);
+                let ctrl1 = p(-20.0, -60.0);
+                let ctrl2 = p(-10.0, 0.0);
+                let at = p(0.0, 0.0);
+                let end = p(20.0 * 3.0_f32.sqrt(), 20.0);
+                let mut path = Path::builder();
+                if reverse {
+                    path.begin(end);
+                    path.line_to(at);
+                    path.cubic_bezier_to(ctrl2, ctrl1, start);
+                } else {
+                    path.begin(start);
+                    path.cubic_bezier_to(ctrl1, ctrl2, at);
+                    path.line_to(end);
+                }
+                path.end(false);
+                let path = path.build();
+                let mut flat = VertexBuffers::<Point, u16>::new();
+                let options = StrokeOptions::default()
+                    .with_line_width(4.0)
+                    .with_miter_limit(1.0)
+                    .with_tolerance(tolerance)
+                    .with_line_join(LineJoin::Arcs);
+                StrokeTessellator::new()
+                    .tessellate_path(&path, &options, &mut simple_builder(&mut flat))
+                    .unwrap();
+                for expected in [p(0.0, -1.9896951), p(0.6164500, -1.9534935)] {
+                    assert!(
+                        flat.vertices
+                            .iter()
+                            .any(|v| (*v - expected).square_length() < 1.0e-8),
+                        "missing mixed clip endpoint: mirror={}, reverse={}, tolerance={}",
+                        mirror,
+                        reverse,
+                        tolerance
+                    );
+                }
+                assert!(
+                    !mesh_contains_point(&flat, p(0.02, -1.992)),
+                    "the removed bevel sector was refilled"
+                );
+                let mut rounded = VertexBuffers::<Point, u16>::new();
+                StrokeTessellator::new()
+                    .tessellate_path(
+                        &path,
+                        &options.with_line_join(LineJoin::ArcsRound),
+                        &mut simple_builder(&mut rounded),
+                    )
+                    .unwrap();
+                assert!(rounded
+                    .vertices
+                    .iter()
+                    .all(|v| v.x.is_finite() && v.y.is_finite()));
+                assert!(
+                    rounded.indices.len() > flat.indices.len(),
+                    "mixed clip should receive a round tip"
+                );
+            }
+        }
     }
 }
 

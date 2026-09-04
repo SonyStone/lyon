@@ -1,7 +1,10 @@
 //! Generate a mesh-rendered join comparison, without browser arcs support.
 //! cargo run -p lyon_tessellation --example arcs -- joins.svg
 
-use lyon_tessellation::path::{math::point, Path};
+use lyon_tessellation::path::{
+    math::{point, Point},
+    Path,
+};
 use lyon_tessellation::{
     BuffersBuilder, LineJoin, StrokeOptions, StrokeTessellator, StrokeVertex, VertexBuffers,
 };
@@ -43,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for triangle in mesh.indices.chunks_exact(3) {
                 let [a, b, c] = [triangle[0], triangle[1], triangle[2]]
                     .map(|index| mesh.vertices[index as usize]);
-                write!(svg, "M{},{} L{},{} {},{} Z ", a.x, a.y, b.x, b.y, c.x, c.y)?;
+                write_triangle(&mut svg, [a, b, c])?;
             }
             svg.push_str("\"/></g>");
         }
@@ -52,6 +55,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&destination, svg)?;
     println!("{destination}");
     Ok(())
+}
+
+fn write_triangle(svg: &mut String, [a, mut b, mut c]: [Point; 3]) -> std::fmt::Result {
+    // Overlapping mesh triangles must add coverage, not cancel under SVG's
+    // nonzero fill rule. Lyon can emit either winding in folded stroke regions.
+    if (b - a).cross(c - a) > 0.0 {
+        core::mem::swap(&mut b, &mut c);
+    }
+    write!(svg, "M{},{} L{},{} {},{} Z ", a.x, a.y, b.x, b.y, c.x, c.y)
+}
+
+#[test]
+fn opposite_triangle_windings_have_identical_svg_coverage() {
+    let a = point(0.0, 0.0);
+    let b = point(10.0, 0.0);
+    let c = point(0.0, 10.0);
+    let mut forward = String::new();
+    let mut reverse = String::new();
+    write_triangle(&mut forward, [a, b, c]).unwrap();
+    write_triangle(&mut reverse, [a, c, b]).unwrap();
+    assert_eq!(forward, reverse);
 }
 
 fn cases() -> Vec<(&'static str, Path)> {

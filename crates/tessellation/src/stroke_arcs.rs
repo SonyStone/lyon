@@ -344,6 +344,8 @@ pub struct ResolvedArcsJoin {
     outgoing_boundary: BoundaryPiece,
     /// Whether a miter-limit edge connects the boundary endpoints.
     clipped: bool,
+    /// A radial cut replaces that support by an offset-to-cut segment.
+    radial_sides: [bool; 2],
     /// Join point on the incoming outer stroke edge, retained for diagnostics.
     #[cfg(test)]
     pub incoming_offset_point: Point64,
@@ -377,9 +379,15 @@ impl ResolvedArcsJoin {
     /// Both directions point from the retained boundary towards the cut.
     pub(crate) fn clip_tangents(&self) -> [Vector64; 2] {
         [
-            boundary_end_tangent(self.incoming_boundary),
-            boundary_end_tangent(self.outgoing_boundary),
+            boundary_end_tangent(self.incoming_boundary)
+                * if self.radial_sides[0] { -1.0 } else { 1.0 },
+            boundary_end_tangent(self.outgoing_boundary)
+                * if self.radial_sides[1] { -1.0 } else { 1.0 },
         ]
+    }
+
+    pub(crate) fn clips_radial_edge(&self) -> bool {
+        self.radial_sides[0] || self.radial_sides[1]
     }
 
     pub(crate) fn turn(&self) -> TurnSide {
@@ -780,12 +788,13 @@ fn resolve_boundaries<const EARLY_MITER_ACCEPT: bool, const EAGER_SWEEP: bool>(
             outgoing_boundary,
         )?
     };
-    let (incoming_boundary, outgoing_boundary, clip) = match clipped {
+    let (incoming_boundary, outgoing_boundary, clip, radial_sides) = match clipped {
         MiterLimitResult::SupportBoundaries {
             incoming_boundary,
             outgoing_boundary,
             clip,
-        } => (incoming_boundary, outgoing_boundary, clip),
+            radial_sides,
+        } => (incoming_boundary, outgoing_boundary, clip, radial_sides),
         MiterLimitResult::RadialEdges(join) => {
             return Ok(JoinConstruction::RadialClip(join));
         }
@@ -795,6 +804,7 @@ fn resolve_boundaries<const EARLY_MITER_ACCEPT: bool, const EAGER_SWEEP: bool>(
         incoming_boundary,
         outgoing_boundary,
         clipped: clip.is_some(),
+        radial_sides,
         #[cfg(test)]
         incoming_offset_point: prepared.incoming_offset_point,
         #[cfg(test)]
@@ -821,6 +831,7 @@ enum MiterLimitResult {
         incoming_boundary: BoundaryPiece,
         outgoing_boundary: BoundaryPiece,
         clip: Option<ClipEdge>,
+        radial_sides: [bool; 2],
     },
     RadialEdges(RadialClipJoin),
 }
@@ -844,26 +855,16 @@ fn apply_miter_limit<const EARLY_ACCEPT: bool>(
             incoming_boundary,
             outgoing_boundary,
             clip: None,
+            radial_sides: [false; 2],
         });
     };
-    match (
+    let (incoming, outgoing) = (
         clip_boundary(incoming_boundary, clip_line, "incoming"),
         clip_boundary(outgoing_boundary, clip_line, "outgoing"),
-    ) {
-        (Ok(incoming_boundary), Ok(outgoing_boundary)) => {
-            let clip = ClipEdge {
-                incoming: boundary_end(incoming_boundary),
-                outgoing: boundary_end(outgoing_boundary),
-                limit_point: clip_line.point,
-                line_direction: clip_line.direction,
-            };
-            Ok(MiterLimitResult::SupportBoundaries {
-                incoming_boundary,
-                outgoing_boundary,
-                clip: Some(clip),
-            })
-        }
-        _ => Ok(MiterLimitResult::RadialEdges(RadialClipJoin {
+    );
+    let radial_sides = [incoming.is_err(), outgoing.is_err()];
+    if radial_sides == [true; 2] {
+        return Ok(MiterLimitResult::RadialEdges(RadialClipJoin {
             turn: prepared.turn,
             incoming_offset_point: prepared.incoming_offset_point,
             outgoing_offset_point: prepared.outgoing_offset_point,
@@ -881,8 +882,46 @@ fn apply_miter_limit<const EARLY_ACCEPT: bool>(
             )?,
             limit_point: clip_line.point,
             line_direction: clip_line.direction,
-        })),
+        }));
     }
+
+    // A tilted cut can enter a radial edge before reaching its support while
+    // still crossing the other support. Keep each surviving boundary separately.
+    let incoming_boundary = match incoming {
+        Ok(boundary) => boundary,
+        Err(_) => BoundaryPiece::Line {
+            start: prepared.incoming_offset_point,
+            end: clip_radial_edge(
+                input.at,
+                prepared.incoming_offset_point,
+                clip_line,
+                "incoming",
+            )?,
+        },
+    };
+    let outgoing_boundary = match outgoing {
+        Ok(boundary) => boundary,
+        Err(_) => BoundaryPiece::Line {
+            start: prepared.outgoing_offset_point,
+            end: clip_radial_edge(
+                input.at,
+                prepared.outgoing_offset_point,
+                clip_line,
+                "outgoing",
+            )?,
+        },
+    };
+    Ok(MiterLimitResult::SupportBoundaries {
+        incoming_boundary,
+        outgoing_boundary,
+        radial_sides,
+        clip: Some(ClipEdge {
+            incoming: boundary_end(incoming_boundary),
+            outgoing: boundary_end(outgoing_boundary),
+            limit_point: clip_line.point,
+            line_direction: clip_line.direction,
+        }),
+    })
 }
 
 fn clip_radial_edge(
@@ -1854,6 +1893,35 @@ mod tests {
                     .abs()
                     <= TEST_EPSILON
         );
+    }
+
+    #[test]
+    fn asymmetric_miter_limit_can_cross_one_support_and_one_radial_edge() {
+        let input = JoinInput {
+            at: Point64::new(0.0, 0.0),
+            incoming: SegmentEnd {
+                tangent: Vector64::new(1.0, 0.0),
+                curvature: -0.4,
+            },
+            outgoing: SegmentEnd {
+                tangent: Vector64::new(3.0_f64.sqrt() * 0.5, 0.5),
+                curvature: 0.0,
+            },
+            half_width: 2.0,
+            miter_limit: 1.0,
+        };
+        let JoinConstruction::Arcs(join) = construct(input).expect("mixed clip must resolve")
+        else {
+            panic!("mixed clipping must preserve the surviving support");
+        };
+        let clip = join.clip.expect("the miter limit must clip the join");
+        assert!(near(clip.incoming.x, 0.0));
+        assert!(clip.incoming.y > -2.0 && clip.incoming.y < -1.98);
+        assert!((clip.outgoing.x - 0.6164500).abs() < 1.0e-6);
+        assert!((clip.outgoing.y + 1.9534935).abs() < 1.0e-6);
+        for end in [clip.incoming, clip.outgoing] {
+            assert!((end - clip.limit_point).cross(clip.line_direction).abs() < 1.0e-9);
+        }
     }
 
     #[test]
