@@ -2023,7 +2023,7 @@ fn compute_join_side_positions_fixed_width(
     //    flattened segment.
     let extruded_normal = front_normal * vertex.half_width;
     let unclipped_miter = (join.line_join == LineJoin::Miter
-        || join.line_join == LineJoin::MiterClip)
+        || (join.line_join == LineJoin::MiterClip && miter_limit >= 1.0))
         && !miter_limit_is_exceeded(front_normal, miter_limit);
 
     let mut fold = false;
@@ -2058,7 +2058,7 @@ fn compute_join_side_positions_fixed_width(
         join.side_points[back_side].single_vertex = Some(miter_pos[back_side]);
         if unclipped_miter {
             join.side_points[front_side].single_vertex = Some(miter_pos[front_side]);
-        } else if join.line_join == LineJoin::MiterClip {
+        } else if join.line_join == LineJoin::MiterClip && miter_limit >= 1.0 {
             let n0 = join.side_points[front_side].prev - join.position;
             let n1 = join.side_points[front_side].next - join.position;
             let (prev_normal, next_normal) =
@@ -2426,7 +2426,14 @@ fn tessellate_join(
     }
 
     if let Some(PreparedArcsJoin::RadialClip(radial_clip)) = arcs_join {
-        if emit_radial_arcs_clip(join, radial_clip, vertex, attributes, output)? {
+        if emit_clipped_join(
+            join,
+            [radial_clip.incoming, radial_clip.outgoing],
+            arcs_outer_side(radial_clip.turn),
+            vertex,
+            attributes,
+            output,
+        )? {
             if requested_join == LineJoin::ArcsRound {
                 round_clip::emit(
                     join,
@@ -2477,6 +2484,34 @@ fn tessellate_join(
                 }
             }
             return Ok(());
+        }
+    }
+
+    // A subunit cut can cross the radial bevel edges. Keep the segment
+    // attachments intact and emit the retained join separately instead of
+    // extending the clipping line backwards into the segment bodies.
+    if join.line_join == LineJoin::MiterClip && options.miter_limit < 1.0 {
+        for side in 0..2 {
+            if join.side_points[side].single_vertex.is_some() {
+                continue;
+            }
+            if let Some((ends, tangents)) = subunit_miter_clip(join, side, options.miter_limit) {
+                if emit_clipped_join(join, ends, side, vertex, attributes, output)? {
+                    if requested_join == LineJoin::ArcsRound {
+                        round_clip::emit(
+                            join,
+                            ends,
+                            tangents,
+                            side,
+                            options.tolerance,
+                            vertex,
+                            attributes,
+                            output,
+                        )?;
+                    }
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -2622,14 +2657,15 @@ fn emit_parallel_arcs_rectangle(
     Ok(())
 }
 
-fn emit_radial_arcs_clip(
+/// Fill between unchanged segment attachments and a pair of clipped join edges.
+fn emit_clipped_join(
     join: &EndpointData,
-    radial_clip: &PreparedRadialClip,
+    [incoming, outgoing]: [Point; 2],
+    outer_side: usize,
     vertex: &mut StrokeVertexData,
     attributes: &dyn AttributeStore,
     output: &mut (impl StrokeGeometryBuilder + ?Sized),
 ) -> Result<bool, TessellationError> {
-    let outer_side = arcs_outer_side(radial_clip.turn);
     let inner_side = 1 - outer_side;
     if join.side_points[inner_side].single_vertex.is_none()
         || join.fold[outer_side]
@@ -2646,27 +2682,27 @@ fn emit_radial_arcs_clip(
         Side::Negative
     };
 
-    vertex.normal = (radial_clip.incoming - join.position) / join.half_width;
+    vertex.normal = (incoming - join.position) / join.half_width;
     let incoming_clip_vertex = output.add_stroke_vertex(StrokeVertex(vertex, attributes))?;
-    let outgoing_clip_vertex = if radial_clip.outgoing == radial_clip.incoming {
+    let outgoing_clip_vertex = if outgoing == incoming {
         incoming_clip_vertex
     } else {
-        vertex.normal = (radial_clip.outgoing - join.position) / join.half_width;
+        vertex.normal = (outgoing - join.position) / join.half_width;
         output.add_stroke_vertex(StrokeVertex(vertex, attributes))?
     };
 
     let inner_vertex = join.side_points[inner_side].prev_vertex;
     let incoming_outer_vertex = join.side_points[outer_side].prev_vertex;
     let outgoing_outer_vertex = join.side_points[outer_side].next_vertex;
-    match radial_clip.turn {
-        TurnSide::Left => {
+    match outer_side {
+        SIDE_NEGATIVE => {
             output.add_triangle(inner_vertex, outgoing_outer_vertex, outgoing_clip_vertex);
             if outgoing_clip_vertex != incoming_clip_vertex {
                 output.add_triangle(inner_vertex, outgoing_clip_vertex, incoming_clip_vertex);
             }
             output.add_triangle(inner_vertex, incoming_clip_vertex, incoming_outer_vertex);
         }
-        TurnSide::Right => {
+        _ => {
             output.add_triangle(inner_vertex, incoming_outer_vertex, incoming_clip_vertex);
             if incoming_clip_vertex != outgoing_clip_vertex {
                 output.add_triangle(inner_vertex, incoming_clip_vertex, outgoing_clip_vertex);
@@ -2676,6 +2712,33 @@ fn emit_radial_arcs_clip(
     }
 
     Ok(true)
+}
+
+/// Find each cut on its radial edge or its straight support, as appropriate.
+fn subunit_miter_clip(
+    join: &EndpointData,
+    side: usize,
+    limit: f32,
+) -> Option<([Point; 2], [Vector64; 2])> {
+    let offsets = [
+        join.side_points[side].prev - join.position,
+        join.side_points[side].next - join.position,
+    ];
+    let bisector = (offsets[0] + offsets[1]).try_normalize()?;
+    let distance = limit * join.half_width;
+    let (incoming, outgoing) = get_clip_intersections(offsets[0], offsets[1], bisector, distance);
+    let mut cuts = [incoming, outgoing];
+    let mut tangents = [Vector64::new(0.0, 0.0); 2];
+    for i in 0..2 {
+        let projection = offsets[i].dot(bisector);
+        if projection > distance {
+            cuts[i] = offsets[i] * (distance / projection);
+            tangents[i] = round_clip::vector64(offsets[i]);
+        } else {
+            tangents[i] = round_clip::vector64(cuts[i] - offsets[i]);
+        }
+    }
+    Some((cuts.map(|offset| join.position + offset), tangents))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3046,12 +3109,13 @@ fn compute_join_side_positions(
     let concave = inward && normal_same_side && !join.fold[side];
 
     if concave
-        || ((join.line_join == LineJoin::Miter || join.line_join == LineJoin::MiterClip)
+        || ((join.line_join == LineJoin::Miter
+            || (join.line_join == LineJoin::MiterClip && miter_limit >= 1.0))
             && !miter_limit_is_exceeded(normal, miter_limit))
     {
         let p = join.position + normal * join.half_width;
         join.side_points[side].single_vertex = Some(p);
-    } else if join.line_join == LineJoin::MiterClip {
+    } else if join.line_join == LineJoin::MiterClip && miter_limit >= 1.0 {
         // It is convenient to handle the miter-clip case here by simply moving
         // tow points on this side to the clip line.
         // This way the rest of the code doesn't differentiate between miter and miter-clip.

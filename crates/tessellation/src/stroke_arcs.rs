@@ -1424,13 +1424,22 @@ fn solve_circle_circle(
         return SymmetricIntersections::None;
     }
 
-    let along_centers = (center_distance * center_distance + first_radius * first_radius
-        - second_radius * second_radius)
-        / (2.0 * center_distance);
-    let height_squared = first_radius * first_radius - along_centers * along_centers;
-    let squared_epsilon = GEOMETRY_EPSILON * first_radius.max(second_radius).max(1.0).powi(2);
+    // Work from the smaller circle. Subtracting the larger squared radius from
+    // another large square loses the intersection of a nearly straight support
+    // with a tighter curve, and a tolerance based on that radius hides both roots.
+    let (small_center, small_radius, large_radius, direction_sign) =
+        if first_radius <= second_radius {
+            (first_center, first_radius, second_radius, 1.0)
+        } else {
+            (second_center, second_radius, first_radius, -1.0)
+        };
+    let along_centers = 0.5
+        * ((center_distance - large_radius) * (1.0 + large_radius / center_distance)
+            + small_radius * (small_radius / center_distance));
+    let height_squared = (small_radius - along_centers) * (small_radius + along_centers);
+    let squared_epsilon = GEOMETRY_EPSILON * small_radius.max(1.0).powi(2);
     let center_direction = between * center_distance.recip();
-    let midpoint = first_center + center_direction * along_centers;
+    let midpoint = small_center + center_direction * (direction_sign * along_centers);
 
     if height_squared.abs() <= squared_epsilon {
         return SymmetricIntersections::One(midpoint);
@@ -2037,6 +2046,47 @@ mod tests {
             Point64::new(4.0, -3.0),
             Point64::new(4.0, 3.0)
         ));
+    }
+
+    #[test]
+    fn unequal_circle_intersections_remain_on_both_supports() {
+        for radius in [1.0e6, 1.0e8, 1.0e10] {
+            for scale in [1.0e-4, 1.0, 1.0e4] {
+                let large_center = Point64::new(0.0, radius * scale);
+                let large_radius = (radius + 2.0) * scale;
+                let small_center = Point64::new(-10.0 * scale, 0.0);
+                let small_radius = 12.0 * scale;
+                for swap in [false, true] {
+                    let result = if swap {
+                        circle_circle_intersections(
+                            small_center,
+                            small_radius,
+                            large_center,
+                            large_radius,
+                        )
+                    } else {
+                        circle_circle_intersections(
+                            large_center,
+                            large_radius,
+                            small_center,
+                            small_radius,
+                        )
+                    };
+                    let Intersections::Two(points) = result else {
+                        panic!("distinct intersections lost: {:?}", result);
+                    };
+                    for p in points {
+                        for (center, radius) in
+                            [(large_center, large_radius), (small_center, small_radius)]
+                        {
+                            let delta = p - center;
+                            let error = (delta.x.hypot(delta.y) - radius).abs();
+                            assert!(error < 1.0e-4 * scale, "support residual {}", error);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
