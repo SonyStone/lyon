@@ -136,15 +136,6 @@ impl StrokeTessellator {
         options: &StrokeOptions,
         builder: &mut dyn StrokeGeometryBuilder,
     ) -> TessellationResult {
-        self.tessellate_impl(input, options, builder)
-    }
-
-    fn tessellate_impl<Output: StrokeGeometryBuilder + ?Sized>(
-        &mut self,
-        input: impl IntoIterator<Item = PathEvent>,
-        options: &StrokeOptions,
-        builder: &mut Output,
-    ) -> TessellationResult {
         debug_assert!(
             options.variable_line_width.is_none(),
             "Variable line width requires custom attributes. Try tessellate_with_ids or tessellate_path",
@@ -168,13 +159,13 @@ impl StrokeTessellator {
         self.tessellate_with_ids_impl(path, positions, custom_attributes, options, output)
     }
 
-    fn tessellate_with_ids_impl<Output: StrokeGeometryBuilder + ?Sized>(
+    fn tessellate_with_ids_impl(
         &mut self,
         path: impl IntoIterator<Item = IdEvent>,
         positions: &impl PositionStore,
         custom_attributes: Option<&dyn AttributeStore>,
         options: &StrokeOptions,
-        output: &mut Output,
+        output: &mut dyn StrokeGeometryBuilder,
     ) -> TessellationResult {
         let custom_attributes = custom_attributes.unwrap_or(&());
 
@@ -199,33 +190,11 @@ impl StrokeTessellator {
         options: &'l StrokeOptions,
         builder: &'l mut dyn StrokeGeometryBuilder,
     ) -> TessellationResult {
-        self.tessellate_path_impl(path.into(), options, builder)
-    }
-
-    /// Compute the tessellation from a path slice with static output dispatch.
-    ///
-    /// This produces the same geometry as [`StrokeTessellator::tessellate_path`]
-    /// while allowing the compiler to specialize the hot stroke-output calls for
-    /// the concrete builder type.
-    pub fn tessellate_path_with_builder<'l, Output: StrokeGeometryBuilder>(
-        &'l mut self,
-        path: impl Into<PathSlice<'l>>,
-        options: &'l StrokeOptions,
-        builder: &'l mut Output,
-    ) -> TessellationResult {
-        self.tessellate_path_impl(path.into(), options, builder)
-    }
-
-    fn tessellate_path_impl<'l, Output: StrokeGeometryBuilder + ?Sized>(
-        &'l mut self,
-        path: PathSlice<'l>,
-        options: &'l StrokeOptions,
-        builder: &'l mut Output,
-    ) -> TessellationResult {
+        let path = path.into();
         if path.num_attributes() > 0 {
-            self.tessellate_with_ids_impl(path.id_iter(), &path, Some(&path), options, builder)
+            self.tessellate_with_ids(path.id_iter(), &path, Some(&path), options, builder)
         } else {
-            self.tessellate_impl(path.iter(), options, builder)
+            self.tessellate(path.iter(), options, builder)
         }
     }
 
@@ -553,7 +522,7 @@ struct SegmentDifferentials {
 ///
 /// Can be created using `StrokeTessellator::builder_with_attributes`.
 pub struct StrokeBuilder<'l> {
-    builder: StrokeBuilderImpl<'l, dyn StrokeGeometryBuilder + 'l>,
+    builder: StrokeBuilderImpl<'l>,
     attrib_store: &'l mut SimpleAttributeStore,
     validator: DebugValidator,
     prev: (Point, EndpointId, f32),
@@ -772,10 +741,10 @@ impl<'l> Build for StrokeBuilder<'l> {
 }
 
 /// A builder that tessellates a stroke directly without allocating any intermediate data structure.
-pub(crate) struct StrokeBuilderImpl<'l, Output: StrokeGeometryBuilder + ?Sized> {
+pub(crate) struct StrokeBuilderImpl<'l> {
     options: StrokeOptions,
     pub(crate) error: Option<TessellationError>,
-    pub(crate) output: &'l mut Output,
+    pub(crate) output: &'l mut dyn StrokeGeometryBuilder,
     vertex: StrokeVertexData<'l>,
     point_buffer: PointBuffer,
     firsts: ArrayVec<EndpointData, 2>,
@@ -787,12 +756,12 @@ pub(crate) struct StrokeBuilderImpl<'l, Output: StrokeGeometryBuilder + ?Sized> 
     arcs_differentials_enabled: bool,
 }
 
-impl<'l, Output: StrokeGeometryBuilder + ?Sized> StrokeBuilderImpl<'l, Output> {
+impl<'l> StrokeBuilderImpl<'l> {
     fn new(
         options: &StrokeOptions,
         attrib_buffer: &'l mut Vec<f32>,
         arcs: &'l mut ArcsState,
-        output: &'l mut Output,
+        output: &'l mut dyn StrokeGeometryBuilder,
     ) -> Self {
         output.begin_geometry();
 
@@ -1759,18 +1728,21 @@ impl<'l, Output: StrokeGeometryBuilder + ?Sized> StrokeBuilderImpl<'l, Output> {
                     add_edge_triangles(prev, join, self.output);
                 }
 
-                tessellate_join(
-                    join,
-                    [prev, &next],
-                    requested_join,
-                    arcs_join.as_ref(),
-                    &self.options,
-                    &mut self.arcs.mesh,
-                    &mut self.arcs.vertex_ids,
-                    &mut self.vertex,
-                    attributes,
-                    self.output,
-                )?;
+                // Flattened joins already have one vertex per side and no join area.
+                if !fast_path {
+                    tessellate_join(
+                        join,
+                        [prev, &next],
+                        requested_join,
+                        arcs_join.as_ref(),
+                        &self.options,
+                        &mut self.arcs.mesh,
+                        &mut self.arcs.vertex_ids,
+                        &mut self.vertex,
+                        attributes,
+                        self.output,
+                    )?;
+                }
 
                 if count == 2 {
                     self.firsts.push(*prev);
@@ -1910,18 +1882,21 @@ impl<'l, Output: StrokeGeometryBuilder + ?Sized> StrokeBuilderImpl<'l, Output> {
                 add_edge_triangles(prev, join, self.output);
             }
 
-            tessellate_join(
-                join,
-                [prev, &next],
-                requested_join,
-                arcs_join.as_ref(),
-                &self.options,
-                &mut self.arcs.mesh,
-                &mut self.arcs.vertex_ids,
-                &mut self.vertex,
-                attributes,
-                self.output,
-            )?;
+            // Flattened joins already have one vertex per side and no join area.
+            if !fast_path {
+                tessellate_join(
+                    join,
+                    [prev, &next],
+                    requested_join,
+                    arcs_join.as_ref(),
+                    &self.options,
+                    &mut self.arcs.mesh,
+                    &mut self.arcs.vertex_ids,
+                    &mut self.vertex,
+                    attributes,
+                    self.output,
+                )?;
+            }
 
             if count == 2 {
                 self.firsts.push(*prev);

@@ -361,10 +361,11 @@ pub struct StrokeOptions {
 }
 
 impl StrokeOptions {
-    /// Minimum miter limit as defined by SVG 2.
+    /// Legacy SVG 1.1 minimum miter limit, retained for compatibility.
     ///
-    /// See [stroke-miterlimit](https://www.w3.org/TR/SVG2/painting.html#StrokeMiterlimitProperty)
-    pub const MINIMUM_MITER_LIMIT: f32 = 0.0;
+    /// SVG 2 permits values down to zero. [`Self::with_miter_limit`] accepts
+    /// that wider range without changing this constant for existing callers.
+    pub const MINIMUM_MITER_LIMIT: f32 = 1.0;
     /// Default miter limit as defined by the SVG specification.
     ///
     /// See [StrokeMiterLimitProperty](https://svgwg.org/specs/strokes/#StrokeMiterlimitProperty)
@@ -426,9 +427,17 @@ impl StrokeOptions {
         self
     }
 
+    /// Set the miter limit, accepting the SVG 2 range of zero and above.
+    ///
+    /// This range applies regardless of the current join, so the order of
+    /// [`Self::with_line_join`] and this method does not matter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limit` is negative or NaN.
     #[inline]
     pub fn with_miter_limit(mut self, limit: f32) -> Self {
-        assert!(limit >= Self::MINIMUM_MITER_LIMIT);
+        assert!(limit >= 0.0);
         self.miter_limit = limit;
         self
     }
