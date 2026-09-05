@@ -13,3 +13,6 @@ Tessellation of filled and stroked 2D paths.
 
 `lyon_tessellation` can be used as a standalone crate or as part of [lyon](https://docs.rs/lyon/) via the `lyon::tessellation` module.
 
+See [Arcs joins](ARCS.md) for the new join modes, compatibility requirements,
+internal responsibilities and benchmark commands.
+
