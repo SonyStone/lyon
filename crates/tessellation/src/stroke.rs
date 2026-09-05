@@ -1625,14 +1625,20 @@ impl<'l> StrokeBuilderImpl<'l> {
             if fast_path {
                 join.line_join = LineJoin::Miter;
                 // can fast-path.
-                flattened_step(
+                if flattened_step(
                     prev,
                     join,
                     &mut next,
                     &mut self.vertex,
                     attributes,
                     self.output,
-                )?;
+                )? {
+                    // Arcs attachments and floating-point rounding can fold
+                    // both edges back even at fixed width. This join has no
+                    // vertices; replace it before connecting or saving it.
+                    self.history.replace_last(&next);
+                    return Ok(true);
+                }
             } else {
                 joins::tessellate_endpoint_join::<true>(
                     join,
