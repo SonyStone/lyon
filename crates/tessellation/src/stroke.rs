@@ -1,7 +1,6 @@
 // There's a number of cases in this file where this lint just complicates the code.
 #![allow(clippy::needless_range_loop)]
 
-use crate::geom::arrayvec::ArrayVec;
 use crate::geom::utils::tangent;
 use crate::geom::{CubicBezierSegment, Line, LineSegment, QuadraticBezierSegment};
 use crate::math::*;
@@ -12,11 +11,8 @@ use crate::path::private::DebugValidator;
 use crate::path::{
     AttributeStore, Attributes, EndpointId, IdEvent, PathEvent, PathSlice, PositionStore, Winding,
 };
-use crate::stroke_arcs::{
-    self, JoinConstruction, JoinInput, ParallelRectangleJoin, Point64, RadialClipJoin,
-    ResolvedArcsJoin, SegmentEnd, TurnSide, Vector64,
-};
-use crate::stroke_arcs_mesh::{ArcsMesh, ArcsOutput, ValidatedFan};
+#[cfg(test)]
+use crate::stroke_arcs::{self, JoinConstruction, JoinInput, Point64, SegmentEnd, Vector64};
 use crate::{
     LineCap, LineJoin, Side, SimpleAttributeStore, StrokeGeometryBuilder, StrokeOptions,
     TessellationError, TessellationResult, VertexId, VertexSource,
@@ -28,8 +24,11 @@ use core::f32::consts::PI;
 #[cfg(not(feature = "std"))]
 use num_traits::Float;
 
-#[path = "stroke_round_clip.rs"]
-mod round_clip;
+#[path = "stroke_history.rs"]
+mod history;
+
+#[path = "stroke_join.rs"]
+mod joins;
 
 const SIDE_POSITIVE: usize = 0;
 const SIDE_NEGATIVE: usize = 1;
@@ -397,118 +396,10 @@ impl Default for EndpointDifferential {
     }
 }
 
+#[derive(Default)]
 struct ArcsState {
-    point_buffer: PointBuffer<EndpointDifferentials>,
-    firsts: ArrayVec<EndpointDifferentials, 2>,
-    next: EndpointDifferentials,
-    mesh: ArcsMesh,
-    vertex_ids: Vec<VertexId>,
-}
-
-impl Default for ArcsState {
-    fn default() -> Self {
-        Self {
-            point_buffer: PointBuffer::new(),
-            firsts: ArrayVec::new(),
-            next: EndpointDifferentials::default(),
-            mesh: ArcsMesh::default(),
-            vertex_ids: Vec::new(),
-        }
-    }
-}
-
-impl ArcsState {
-    fn reset_differentials(&mut self, point_count: usize) {
-        self.point_buffer.clear();
-        self.firsts.clear();
-        self.next = EndpointDifferentials::default();
-        for _ in 0..point_count {
-            self.point_buffer.push(EndpointDifferentials::default());
-        }
-    }
-
-    fn record_segment(&mut self, differentials: SegmentDifferentials) {
-        self.point_buffer.last_mut().outgoing = differentials.start;
-        self.next.incoming = differentials.end;
-    }
-
-    fn push_next(&mut self, is_endpoint: bool) {
-        let next = self.take_next(is_endpoint);
-        self.point_buffer.push(next);
-    }
-
-    fn replace_last_with_next(&mut self, is_endpoint: bool) {
-        let next = self.take_next(is_endpoint);
-        self.point_buffer.replace_last(next);
-    }
-
-    fn take_next(&mut self, is_endpoint: bool) -> EndpointDifferentials {
-        if !is_endpoint {
-            return EndpointDifferentials::default();
-        }
-
-        let next = self.next;
-        self.next = EndpointDifferentials::default();
-        next
-    }
-
-    fn capture_firsts(&mut self) {
-        let (prev, join) = self.point_buffer.last_two();
-        self.firsts.push(*prev);
-        self.firsts.push(*join);
-    }
-
-    fn prepare_first_for_close(&mut self, last_position: Point, first_position: Point) {
-        let mut first = self.firsts[0];
-        if last_position == first_position {
-            self.point_buffer.last_mut().outgoing = first.outgoing;
-        } else {
-            let closing = line_differentials(last_position, first_position);
-            self.point_buffer.last_mut().outgoing = closing.start;
-            first.incoming = closing.end;
-        }
-        self.next = first;
-    }
-
-    fn prepare_second_for_close(&mut self) {
-        self.next = self.firsts[1];
-    }
-
-    fn clear(&mut self) {
-        self.reset_differentials(0);
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum ArcsJoinFallback {
-    Round,
-}
-
-#[allow(clippy::large_enum_variant)] // Join preparation must not allocate in the stroke hot path.
-enum PreparedArcsJoin {
-    Curved(ResolvedArcsJoin),
-    ParallelRectangle(PreparedParallelRectangle),
-    RadialClip(PreparedRadialClip),
-}
-
-#[cfg(not(test))]
-const _: () = assert!(core::mem::size_of::<PreparedArcsJoin>() <= 152);
-
-#[derive(Copy, Clone)]
-struct PreparedParallelRectangle {
-    near_left: Point,
-    near_right: Point,
-    far_left: Point,
-    far_right: Point,
-}
-
-#[derive(Copy, Clone)]
-struct PreparedRadialClip {
-    turn: TurnSide,
-    incoming_offset_point: Point,
-    outgoing_offset_point: Point,
-    incoming: Point,
-    outgoing: Point,
+    history: history::DifferentialHistory,
+    joins: joins::JoinWorkspace,
 }
 
 #[derive(Copy, Clone)]
@@ -746,14 +637,12 @@ pub(crate) struct StrokeBuilderImpl<'l> {
     pub(crate) error: Option<TessellationError>,
     pub(crate) output: &'l mut dyn StrokeGeometryBuilder,
     vertex: StrokeVertexData<'l>,
-    point_buffer: PointBuffer,
-    firsts: ArrayVec<EndpointData, 2>,
+    history: history::EndpointHistory<'l>,
     previous: Option<EndpointData>,
     sub_path_start_advancement: f32,
     square_merge_threshold: f32,
     may_need_empty_cap: bool,
-    arcs: &'l mut ArcsState,
-    arcs_differentials_enabled: bool,
+    arcs: &'l mut joins::JoinWorkspace,
 }
 
 impl<'l> StrokeBuilderImpl<'l> {
@@ -767,9 +656,6 @@ impl<'l> StrokeBuilderImpl<'l> {
 
         let arcs_differentials_enabled =
             matches!(options.line_join, LineJoin::Arcs | LineJoin::ArcsRound);
-        if arcs_differentials_enabled {
-            arcs.reset_differentials(0);
-        }
 
         // Ideally we'd use the bounding rect of the path as an indication
         // of what is considered a very small distance between two points,
@@ -797,14 +683,12 @@ impl<'l> StrokeBuilderImpl<'l> {
                 },
                 buffer_is_valid: false,
             },
-            point_buffer: PointBuffer::new(),
-            firsts: ArrayVec::new(),
+            history: history::EndpointHistory::new(&mut arcs.history, arcs_differentials_enabled),
             previous: None,
             sub_path_start_advancement: 0.0,
             square_merge_threshold,
             may_need_empty_cap: false,
-            arcs,
-            arcs_differentials_enabled,
+            arcs: &mut arcs.joins,
         }
     }
 
@@ -816,30 +700,14 @@ impl<'l> StrokeBuilderImpl<'l> {
     }
 
     fn set_line_join(&mut self, join: LineJoin) {
-        if matches!(join, LineJoin::Arcs | LineJoin::ArcsRound) && !self.arcs_differentials_enabled
-        {
-            self.arcs.reset_differentials(self.point_buffer.count());
-            // The contour may already have saved its first two points for closing.
-            // Their curvature was not recorded before arcs tracking was enabled.
-            for _ in 0..self.firsts.len() {
-                self.arcs.firsts.push(EndpointDifferentials::default());
-            }
-            self.arcs_differentials_enabled = true;
+        if matches!(join, LineJoin::Arcs | LineJoin::ArcsRound) {
+            self.history.enable_differentials();
         }
         self.options.line_join = join;
     }
 
     fn record_segment_differentials(&mut self, compute: impl FnOnce() -> SegmentDifferentials) {
-        if self.arcs_differentials_enabled {
-            self.arcs.record_segment(compute());
-        }
-    }
-
-    fn record_closing_differentials(&mut self, first_position: Point) {
-        if self.arcs_differentials_enabled {
-            self.arcs
-                .prepare_first_for_close(self.point_buffer.last().position, first_position);
-        }
+        self.history.record_segment(compute);
     }
 
     pub(crate) fn tessellate_with_ids(
@@ -1194,7 +1062,7 @@ impl<'l> StrokeBuilderImpl<'l> {
         attributes: &dyn AttributeStore,
     ) {
         let half_width = width * 0.5;
-        let from = self.point_buffer.last().position;
+        let from = self.history.last().position;
         self.record_segment_differentials(|| line_differentials(from, to));
         self.step(
             EndpointData {
@@ -1310,7 +1178,7 @@ impl<'l> StrokeBuilderImpl<'l> {
         attributes: &dyn AttributeStore,
     ) {
         let half_width = self.options.line_width * 0.5;
-        let from = self.point_buffer.last().position;
+        let from = self.history.last().position;
         self.record_segment_differentials(|| line_differentials(from, to));
         self.fixed_width_step(
             EndpointData {
@@ -1398,8 +1266,8 @@ impl<'l> StrokeBuilderImpl<'l> {
     }
 
     pub(crate) fn end(&mut self, close: bool, attributes: &dyn AttributeStore) {
-        self.may_need_empty_cap |= close && self.point_buffer.count() == 1;
-        let e = if close && self.point_buffer.count() > 2 {
+        self.may_need_empty_cap |= close && self.history.count() == 1;
+        let e = if close && self.history.count() > 2 {
             self.close(attributes)
         } else {
             self.end_with_caps(attributes)
@@ -1409,11 +1277,7 @@ impl<'l> StrokeBuilderImpl<'l> {
             self.error(e);
         }
 
-        self.point_buffer.clear();
-        self.firsts.clear();
-        if self.arcs_differentials_enabled {
-            self.arcs.clear();
-        }
+        self.history.clear();
     }
 
     pub(crate) fn build(self) -> TessellationResult {
@@ -1428,18 +1292,17 @@ impl<'l> StrokeBuilderImpl<'l> {
     }
 
     fn close(&mut self, attributes: &dyn AttributeStore) -> Result<(), TessellationError> {
-        if self.point_buffer.count() == 1 {
+        if self.history.count() == 1 {
             self.tessellate_empty_cap(attributes)?;
         }
 
-        if self.point_buffer.count() <= 2 {
+        if self.history.count() <= 2 {
             return Ok(());
         }
 
-        assert!(!self.firsts.is_empty());
+        assert!(!self.history.firsts().is_empty());
 
-        let mut p = self.firsts[0];
-        self.record_closing_differentials(p.position);
+        let mut p = *self.history.first_for_close();
         // Make sure we re-compute the advancement instead of using the one found at the
         // beginning of the sub-path.
         let advancement = p.advancement;
@@ -1453,27 +1316,23 @@ impl<'l> StrokeBuilderImpl<'l> {
         if !segment_added {
             // The closing code relies on not skipping the edge from the first to
             // the second point. In most case this is ensured by points not being
-            // added to self.firsts if they are not far enough apart. However there
+            // added to self.history.firsts() if they are not far enough apart. However there
             // could still be a situation where the last point is placed in such
             // a way that it is within merge range of both the first and second
             // points.
             // Fixing the position up ensures that even though we skip the edge to
             // the first point, we don't skip the edge to the second one.
-            self.point_buffer.last_mut().position = p.position;
+            self.history.last_mut().position = p.position;
         }
 
-        if self.firsts.len() >= 2 {
-            let p2 = self.firsts[1];
-            if self.arcs_differentials_enabled {
-                self.arcs.prepare_second_for_close();
-            }
+        if let Some(p2) = self.history.second_for_close().copied() {
             if self.options.variable_line_width.is_some() {
                 self.step_impl(p2, attributes)?;
             } else {
                 self.fixed_width_step_impl(p2, attributes)?;
             }
 
-            let (p0, p1) = self.point_buffer.last_two_mut();
+            let (p0, p1) = self.history.last_two_mut();
             // TODO: This is hacky: We re-create the first two vertices on the edge towards the second endpoint
             // so that they use the advancement value of the start of the sub path instead of the end of the
             // sub path as computed in the step_impl above.
@@ -1511,7 +1370,7 @@ impl<'l> StrokeBuilderImpl<'l> {
         &mut self,
         attributes: &dyn AttributeStore,
     ) -> Result<(), TessellationError> {
-        let point = self.point_buffer.get(0);
+        let point = self.history.get(0);
         self.vertex.advancement = point.advancement;
         self.vertex.src = point.src;
         self.vertex.half_width = point.half_width;
@@ -1548,7 +1407,7 @@ impl<'l> StrokeBuilderImpl<'l> {
     }
 
     fn end_with_caps(&mut self, attributes: &dyn AttributeStore) -> Result<(), TessellationError> {
-        let count = self.point_buffer.count();
+        let count = self.history.count();
 
         if self.may_need_empty_cap && count == 1 {
             return self.tessellate_empty_cap(attributes);
@@ -1559,7 +1418,7 @@ impl<'l> StrokeBuilderImpl<'l> {
 
             // Add a fake fake point p2 aligned with p0 and p1 so that we can tessellate
             // the join for p1.
-            let (p0, p1) = self.point_buffer.last_two_mut();
+            let (p0, p1) = self.history.last_two_mut();
             let mut p0 = *p0;
             let mut p1 = *p1;
 
@@ -1587,8 +1446,8 @@ impl<'l> StrokeBuilderImpl<'l> {
             self.sub_path_start_advancement = p1.advancement;
 
             if count > 2 {
-                p0 = self.firsts[0];
-                p1 = self.firsts[1];
+                p0 = self.history.firsts()[0];
+                p1 = self.history.firsts()[1];
             }
 
             // First edge.
@@ -1610,12 +1469,11 @@ impl<'l> StrokeBuilderImpl<'l> {
         mut next: EndpointData,
         attributes: &dyn AttributeStore,
     ) -> Result<bool, TessellationError> {
-        let count = self.point_buffer.count();
+        let count = self.history.count();
 
         debug_assert!(self.options.variable_line_width.is_some());
 
-        if count > 0 && self.points_are_too_close(self.point_buffer.last().position, next.position)
-        {
+        if count > 0 && self.points_are_too_close(self.history.last().position, next.position) {
             if count == 1 {
                 // move-to followed by empty segment and end of paths means we have to generate
                 // an empty cap.
@@ -1631,7 +1489,7 @@ impl<'l> StrokeBuilderImpl<'l> {
         }
 
         if count > 0 {
-            let join = self.point_buffer.last_mut();
+            let join = self.history.last_mut();
             // Compute the position of the vertices that act as reference the edge between
             // p0 and next
             if !join.is_flattening_step || !next.is_flattening_step {
@@ -1641,7 +1499,7 @@ impl<'l> StrokeBuilderImpl<'l> {
 
         let mut skip = false;
         if count > 1 {
-            let (prev, join) = self.point_buffer.last_two_mut();
+            let (prev, join, differentials) = self.history.join_mut();
             nan_check!(join.advancement);
             nan_check!(prev.advancement);
 
@@ -1659,8 +1517,6 @@ impl<'l> StrokeBuilderImpl<'l> {
             } else {
                 false
             };
-            let requested_join = join.line_join;
-            let mut arcs_join = None;
             if fast_path {
                 join.line_join = LineJoin::Miter;
                 // can fast-path.
@@ -1673,97 +1529,34 @@ impl<'l> StrokeBuilderImpl<'l> {
                     self.output,
                 )?;
             } else {
-                if matches!(join.line_join, LineJoin::Arcs | LineJoin::ArcsRound) {
-                    debug_assert!(self.arcs_differentials_enabled);
-                    let differentials = *self.arcs.point_buffer.last();
-                    arcs_join = prepare_arcs_join(join, differentials, &self.options);
-                }
-                compute_join_side_positions(
-                    prev,
+                joins::tessellate_endpoint_join::<false>(
                     join,
-                    &next,
-                    self.options.miter_limit,
-                    SIDE_POSITIVE,
-                );
-                compute_join_side_positions(
-                    prev,
-                    join,
-                    &next,
-                    self.options.miter_limit,
-                    SIDE_NEGATIVE,
-                );
-                if let Some(resolved) = arcs_join.as_ref() {
-                    if align_arcs_side_points(join, resolved).is_err() {
-                        join.line_join = LineJoin::Round;
-                        arcs_join = None;
-                    }
-                }
-
-                // Prevent folding when the other side is concave.
-                if join.side_points[SIDE_POSITIVE].single_vertex.is_some() {
-                    join.fold[SIDE_NEGATIVE] = false;
-                }
-                if join.side_points[SIDE_NEGATIVE].single_vertex.is_some() {
-                    join.fold[SIDE_POSITIVE] = false;
-                }
-
-                add_join_base_vertices(
-                    join,
+                    [prev, &next],
+                    differentials,
+                    count > 2,
+                    &self.options,
+                    self.arcs,
                     &mut self.vertex,
                     attributes,
                     self.output,
-                    Side::Negative,
-                )?;
-                add_join_base_vertices(
-                    join,
-                    &mut self.vertex,
-                    attributes,
-                    self.output,
-                    Side::Positive,
                 )?;
             }
 
             if !skip {
-                if count > 2 {
+                if fast_path && count > 2 {
                     add_edge_triangles(prev, join, self.output);
                 }
 
-                // Flattened joins already have one vertex per side and no join area.
-                if !fast_path {
-                    tessellate_join(
-                        join,
-                        [prev, &next],
-                        requested_join,
-                        arcs_join.as_ref(),
-                        &self.options,
-                        &mut self.arcs.mesh,
-                        &mut self.arcs.vertex_ids,
-                        &mut self.vertex,
-                        attributes,
-                        self.output,
-                    )?;
-                }
-
                 if count == 2 {
-                    self.firsts.push(*prev);
-                    self.firsts.push(*join);
-                    if self.arcs_differentials_enabled {
-                        self.arcs.capture_firsts();
-                    }
+                    self.history.capture_firsts();
                 }
             }
         }
 
         if skip {
-            if self.arcs_differentials_enabled {
-                self.arcs.replace_last_with_next(next.src.is_endpoint());
-            }
-            self.point_buffer.replace_last(next);
+            self.history.replace_last(&next);
         } else {
-            if self.arcs_differentials_enabled {
-                self.arcs.push_next(next.src.is_endpoint());
-            }
-            self.point_buffer.push(next);
+            self.history.push(&next);
         }
 
         Ok(true)
@@ -1780,12 +1573,12 @@ impl<'l> StrokeBuilderImpl<'l> {
         mut next: EndpointData,
         attributes: &dyn AttributeStore,
     ) -> Result<bool, TessellationError> {
-        let count = self.point_buffer.count();
+        let count = self.history.count();
 
         debug_assert!(self.options.variable_line_width.is_none());
 
         if count > 0 {
-            if self.points_are_too_close(self.point_buffer.last().position, next.position) {
+            if self.points_are_too_close(self.history.last().position, next.position) {
                 if count == 1 {
                     self.may_need_empty_cap = true;
                 }
@@ -1796,7 +1589,7 @@ impl<'l> StrokeBuilderImpl<'l> {
                 // TODO: this is a bit hacky: with the fixed width fast path we only compute the
                 // side point positions for joins but we'll need it for the first point when we get
                 // back to tessellating the first edge.
-                let first = self.point_buffer.last_mut();
+                let first = self.history.last_mut();
                 let edge = next.position - first.position;
                 let length = edge.length();
 
@@ -1814,7 +1607,7 @@ impl<'l> StrokeBuilderImpl<'l> {
         }
 
         if count > 1 {
-            let (prev, join) = self.point_buffer.last_two_mut();
+            let (prev, join, differentials) = self.history.join_mut();
 
             self.vertex.src = join.src;
             self.vertex.position_on_path = join.position;
@@ -1829,8 +1622,6 @@ impl<'l> StrokeBuilderImpl<'l> {
             } else {
                 false
             };
-            let requested_join = join.line_join;
-            let mut arcs_join = None;
             if fast_path {
                 join.line_join = LineJoin::Miter;
                 // can fast-path.
@@ -1843,74 +1634,29 @@ impl<'l> StrokeBuilderImpl<'l> {
                     self.output,
                 )?;
             } else {
-                if matches!(join.line_join, LineJoin::Arcs | LineJoin::ArcsRound) {
-                    debug_assert!(self.arcs_differentials_enabled);
-                    let differentials = *self.arcs.point_buffer.last();
-                    arcs_join = prepare_arcs_join(join, differentials, &self.options);
-                }
-                compute_join_side_positions_fixed_width(
-                    prev,
+                joins::tessellate_endpoint_join::<true>(
                     join,
-                    &next,
-                    self.options.miter_limit,
-                    &mut self.vertex,
-                )?;
-                if let Some(resolved) = arcs_join.as_ref() {
-                    if align_arcs_side_points(join, resolved).is_err() {
-                        join.line_join = LineJoin::Round;
-                        arcs_join = None;
-                    }
-                }
-
-                add_join_base_vertices(
-                    join,
+                    [prev, &next],
+                    differentials,
+                    count > 2,
+                    &self.options,
+                    self.arcs,
                     &mut self.vertex,
                     attributes,
                     self.output,
-                    Side::Negative,
-                )?;
-                add_join_base_vertices(
-                    join,
-                    &mut self.vertex,
-                    attributes,
-                    self.output,
-                    Side::Positive,
                 )?;
             }
 
-            if count > 2 {
+            if fast_path && count > 2 {
                 add_edge_triangles(prev, join, self.output);
             }
 
-            // Flattened joins already have one vertex per side and no join area.
-            if !fast_path {
-                tessellate_join(
-                    join,
-                    [prev, &next],
-                    requested_join,
-                    arcs_join.as_ref(),
-                    &self.options,
-                    &mut self.arcs.mesh,
-                    &mut self.arcs.vertex_ids,
-                    &mut self.vertex,
-                    attributes,
-                    self.output,
-                )?;
-            }
-
             if count == 2 {
-                self.firsts.push(*prev);
-                self.firsts.push(*join);
-                if self.arcs_differentials_enabled {
-                    self.arcs.capture_firsts();
-                }
+                self.history.capture_firsts();
             }
         }
 
-        if self.arcs_differentials_enabled {
-            self.arcs.push_next(next.src.is_endpoint());
-        }
-        self.point_buffer.push(next);
+        self.history.push(&next);
 
         Ok(true)
     }
@@ -2239,739 +1985,7 @@ fn add_edge_triangles(
     }
 }
 
-fn resolve_arcs_join(
-    join: &EndpointData,
-    differentials: EndpointDifferentials,
-    options: &StrokeOptions,
-) -> Result<JoinConstruction, ArcsJoinFallback> {
-    let (
-        EndpointDifferential::Regular {
-            unit_tangent: incoming_tangent,
-            curvature: incoming_curvature,
-        },
-        EndpointDifferential::Regular {
-            unit_tangent: outgoing_tangent,
-            curvature: outgoing_curvature,
-        },
-    ) = (differentials.incoming, differentials.outgoing)
-    else {
-        return Err(ArcsJoinFallback::Round);
-    };
-
-    let input = JoinInput {
-        at: Point64::new(f64::from(join.position.x), f64::from(join.position.y)),
-        incoming: SegmentEnd {
-            tangent: Vector64::new(f64::from(incoming_tangent.x), f64::from(incoming_tangent.y)),
-            curvature: incoming_curvature,
-        },
-        outgoing: SegmentEnd {
-            tangent: Vector64::new(f64::from(outgoing_tangent.x), f64::from(outgoing_tangent.y)),
-            curvature: outgoing_curvature,
-        },
-        half_width: f64::from(join.half_width),
-        miter_limit: f64::from(options.miter_limit),
-    };
-
-    stroke_arcs::construct_svg2(input).map_err(|_| ArcsJoinFallback::Round)
-}
-
-fn prepare_arcs_join(
-    join: &mut EndpointData,
-    differentials: EndpointDifferentials,
-    options: &StrokeOptions,
-) -> Option<PreparedArcsJoin> {
-    debug_assert!(matches!(
-        join.line_join,
-        LineJoin::Arcs | LineJoin::ArcsRound
-    ));
-
-    let resolved = resolve_arcs_join(join, differentials, options);
-    match resolved {
-        Ok(JoinConstruction::Empty) => join.line_join = LineJoin::Miter,
-        Ok(JoinConstruction::MiterClip) => join.line_join = LineJoin::MiterClip,
-        Err(ArcsJoinFallback::Round) => {
-            join.line_join = LineJoin::Round;
-        }
-        Ok(JoinConstruction::ParallelRectangle(rectangle)) => {
-            if let Ok(rectangle) = prepare_parallel_rectangle(rectangle) {
-                return Some(PreparedArcsJoin::ParallelRectangle(rectangle));
-            }
-            join.line_join = LineJoin::Round;
-        }
-        Ok(JoinConstruction::RadialClip(radial_clip)) => {
-            if let Ok(radial_clip) = prepare_radial_clip(radial_clip) {
-                return Some(PreparedArcsJoin::RadialClip(radial_clip));
-            }
-            join.line_join = LineJoin::Round;
-        }
-        Ok(JoinConstruction::Arcs(resolved)) => return Some(PreparedArcsJoin::Curved(resolved)),
-    }
-
-    None
-}
-
-fn prepare_radial_clip(
-    radial_clip: RadialClipJoin,
-) -> Result<PreparedRadialClip, ArcsJoinFallback> {
-    Ok(PreparedRadialClip {
-        turn: radial_clip.turn,
-        incoming_offset_point: point64_to_point(radial_clip.incoming_offset_point)?,
-        outgoing_offset_point: point64_to_point(radial_clip.outgoing_offset_point)?,
-        incoming: point64_to_point(radial_clip.incoming)?,
-        outgoing: point64_to_point(radial_clip.outgoing)?,
-    })
-}
-
-fn prepare_parallel_rectangle(
-    rectangle: ParallelRectangleJoin,
-) -> Result<PreparedParallelRectangle, ArcsJoinFallback> {
-    Ok(PreparedParallelRectangle {
-        near_left: point64_to_point(rectangle.near_left)?,
-        near_right: point64_to_point(rectangle.near_right)?,
-        far_left: point64_to_point(rectangle.far_left)?,
-        far_right: point64_to_point(rectangle.far_right)?,
-    })
-}
-
-fn align_arcs_side_points(
-    join: &mut EndpointData,
-    prepared: &PreparedArcsJoin,
-) -> Result<(), ArcsJoinFallback> {
-    match prepared {
-        PreparedArcsJoin::Curved(resolved) => {
-            let incoming = point64_to_point(resolved.incoming_offset_point())?;
-            let outgoing = point64_to_point(resolved.outgoing_offset_point())?;
-            let side = arcs_outer_side(resolved.turn());
-            join.side_points[side].prev = incoming;
-            join.side_points[side].next = outgoing;
-            join.side_points[side].single_vertex = None;
-        }
-        PreparedArcsJoin::ParallelRectangle(rectangle) => {
-            join.side_points[SIDE_POSITIVE].prev = rectangle.near_left;
-            join.side_points[SIDE_POSITIVE].next = rectangle.near_right;
-            join.side_points[SIDE_POSITIVE].single_vertex = None;
-            join.side_points[SIDE_NEGATIVE].prev = rectangle.near_right;
-            join.side_points[SIDE_NEGATIVE].next = rectangle.near_left;
-            join.side_points[SIDE_NEGATIVE].single_vertex = None;
-            join.fold = [false, false];
-        }
-        PreparedArcsJoin::RadialClip(radial_clip) => {
-            let side = arcs_outer_side(radial_clip.turn);
-            join.side_points[side].prev = radial_clip.incoming_offset_point;
-            join.side_points[side].next = radial_clip.outgoing_offset_point;
-            join.side_points[side].single_vertex = None;
-        }
-    }
-    Ok(())
-}
-
-fn arcs_outer_side(turn: TurnSide) -> usize {
-    match turn {
-        TurnSide::Left => SIDE_NEGATIVE,
-        TurnSide::Right => SIDE_POSITIVE,
-    }
-}
-
-fn point64_to_point(value: Point64) -> Result<Point, ArcsJoinFallback> {
-    let minimum = f64::from(f32::MIN);
-    let maximum = f64::from(f32::MAX);
-    if !value.x.is_finite()
-        || !value.y.is_finite()
-        || value.x < minimum
-        || value.x > maximum
-        || value.y < minimum
-        || value.y > maximum
-    {
-        return Err(ArcsJoinFallback::Round);
-    }
-
-    Ok(point(value.x as f32, value.y as f32))
-}
-
-fn tessellate_join(
-    join: &mut EndpointData,
-    neighbors: [&EndpointData; 2],
-    requested_join: LineJoin,
-    arcs_join: Option<&PreparedArcsJoin>,
-    options: &StrokeOptions,
-    arcs_mesh: &mut ArcsMesh,
-    arcs_vertex_ids: &mut Vec<VertexId>,
-    vertex: &mut StrokeVertexData,
-    attributes: &dyn AttributeStore,
-    output: &mut (impl StrokeGeometryBuilder + ?Sized),
-) -> Result<(), TessellationError> {
-    debug_assert!(
-        !matches!(join.line_join, LineJoin::Arcs | LineJoin::ArcsRound) || arcs_join.is_some()
-    );
-
-    if let Some(PreparedArcsJoin::ParallelRectangle(rectangle)) = arcs_join {
-        emit_parallel_arcs_rectangle(join, rectangle, vertex, attributes, output)?;
-        if requested_join == LineJoin::ArcsRound && options.miter_limit > 0.0 {
-            round_clip::emit(
-                join,
-                [rectangle.far_left, rectangle.far_right],
-                [
-                    rectangle.far_left - rectangle.near_left,
-                    rectangle.far_right - rectangle.near_right,
-                ]
-                .map(round_clip::vector64),
-                SIDE_POSITIVE,
-                options.tolerance,
-                vertex,
-                attributes,
-                output,
-            )?;
-        }
-        return Ok(());
-    }
-
-    if let Some(PreparedArcsJoin::RadialClip(radial_clip)) = arcs_join {
-        if emit_clipped_join(
-            join,
-            [radial_clip.incoming, radial_clip.outgoing],
-            arcs_outer_side(radial_clip.turn),
-            vertex,
-            attributes,
-            output,
-        )? {
-            if requested_join == LineJoin::ArcsRound {
-                round_clip::emit(
-                    join,
-                    [radial_clip.incoming, radial_clip.outgoing],
-                    [
-                        radial_clip.incoming - join.position,
-                        radial_clip.outgoing - join.position,
-                    ]
-                    .map(round_clip::vector64),
-                    arcs_outer_side(radial_clip.turn),
-                    options.tolerance,
-                    vertex,
-                    attributes,
-                    output,
-                )?;
-            }
-            return Ok(());
-        }
-    }
-
-    if let Some(PreparedArcsJoin::Curved(resolved)) = arcs_join {
-        if resolved.clips_radial_edge()
-            && emit_mixed_arcs_clip(
-                join,
-                resolved,
-                options,
-                arcs_mesh,
-                arcs_vertex_ids,
-                vertex,
-                attributes,
-                output,
-            )?
-        {
-            if requested_join == LineJoin::ArcsRound {
-                if let Some([a, b]) = resolved.clip_endpoints() {
-                    if let [Ok(a), Ok(b)] = [point64_to_point(a), point64_to_point(b)] {
-                        round_clip::emit(
-                            join,
-                            [a, b],
-                            resolved.clip_tangents(),
-                            arcs_outer_side(resolved.turn()),
-                            options.tolerance,
-                            vertex,
-                            attributes,
-                            output,
-                        )?;
-                    }
-                }
-            }
-            return Ok(());
-        }
-    }
-
-    // A subunit cut can cross the radial bevel edges. Keep the segment
-    // attachments intact and emit the retained join separately instead of
-    // extending the clipping line backwards into the segment bodies.
-    if join.line_join == LineJoin::MiterClip && options.miter_limit < 1.0 {
-        for side in 0..2 {
-            if join.side_points[side].single_vertex.is_some() {
-                continue;
-            }
-            if let Some((ends, tangents)) = subunit_miter_clip(join, side, options.miter_limit) {
-                if emit_clipped_join(join, ends, side, vertex, attributes, output)? {
-                    if requested_join == LineJoin::ArcsRound {
-                        round_clip::emit(
-                            join,
-                            ends,
-                            tangents,
-                            side,
-                            options.tolerance,
-                            vertex,
-                            attributes,
-                            output,
-                        )?;
-                    }
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    let side_needs_join = [
-        join.side_points[SIDE_POSITIVE].single_vertex.is_none() && !join.fold[SIDE_NEGATIVE],
-        join.side_points[SIDE_NEGATIVE].single_vertex.is_none() && !join.fold[SIDE_POSITIVE],
-    ];
-
-    if !join.fold[SIDE_POSITIVE] && !join.fold[SIDE_NEGATIVE] {
-        // Tessellate the interior of the join.
-        match side_needs_join {
-            [true, true] => {
-                output.add_triangle(
-                    join.side_points[SIDE_POSITIVE].prev_vertex,
-                    join.side_points[SIDE_POSITIVE].next_vertex,
-                    join.side_points[SIDE_NEGATIVE].next_vertex,
-                );
-
-                output.add_triangle(
-                    join.side_points[SIDE_POSITIVE].prev_vertex,
-                    join.side_points[SIDE_NEGATIVE].next_vertex,
-                    join.side_points[SIDE_NEGATIVE].prev_vertex,
-                );
-            }
-            [false, true] => {
-                output.add_triangle(
-                    join.side_points[SIDE_NEGATIVE].prev_vertex,
-                    join.side_points[SIDE_POSITIVE].prev_vertex,
-                    join.side_points[SIDE_NEGATIVE].next_vertex,
-                );
-            }
-            [true, false] => {
-                output.add_triangle(
-                    join.side_points[SIDE_NEGATIVE].prev_vertex,
-                    join.side_points[SIDE_POSITIVE].prev_vertex,
-                    join.side_points[SIDE_POSITIVE].next_vertex,
-                );
-            }
-            [false, false] => {}
-        }
-    }
-
-    // Tessellate the remaining specific shape for convex joins
-    for side in 0..2 {
-        if !side_needs_join[side] {
-            continue;
-        }
-
-        match join.line_join {
-            LineJoin::Round => {
-                tessellate_round_join(join, side, options, vertex, attributes, output)?;
-            }
-            LineJoin::Arcs | LineJoin::ArcsRound => {
-                let emitted = if let Some(PreparedArcsJoin::Curved(resolved)) = arcs_join {
-                    side == arcs_outer_side(resolved.turn())
-                        && emit_arcs_join(
-                            join,
-                            resolved,
-                            side,
-                            options,
-                            arcs_mesh,
-                            arcs_vertex_ids,
-                            vertex,
-                            attributes,
-                            output,
-                        )?
-                } else {
-                    false
-                };
-                if emitted && requested_join == LineJoin::ArcsRound {
-                    if let Some(PreparedArcsJoin::Curved(resolved)) = arcs_join {
-                        if let Some(ends) = resolved.clip_endpoints() {
-                            let ends = [point64_to_point(ends[0]), point64_to_point(ends[1])];
-                            if let [Ok(a), Ok(b)] = ends {
-                                round_clip::emit(
-                                    join,
-                                    [a, b],
-                                    resolved.clip_tangents(),
-                                    side,
-                                    options.tolerance,
-                                    vertex,
-                                    attributes,
-                                    output,
-                                )?;
-                            }
-                        }
-                    }
-                }
-                if !emitted {
-                    tessellate_round_join(join, side, options, vertex, attributes, output)?;
-                }
-            }
-            LineJoin::MiterClip if requested_join == LineJoin::ArcsRound => {
-                // A surviving pair of distinct outer vertices is the actual
-                // miter cut. Unclipped miters have a single shared vertex.
-                round_clip::emit(
-                    join,
-                    [join.side_points[side].prev, join.side_points[side].next],
-                    [
-                        round_clip::edge_tangent(neighbors[0], join, side),
-                        -round_clip::edge_tangent(join, neighbors[1], side),
-                    ],
-                    side,
-                    options.tolerance,
-                    vertex,
-                    attributes,
-                    output,
-                )?;
-            }
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
-
-fn emit_parallel_arcs_rectangle(
-    join: &EndpointData,
-    rectangle: &PreparedParallelRectangle,
-    vertex: &mut StrokeVertexData,
-    attributes: &dyn AttributeStore,
-    output: &mut (impl StrokeGeometryBuilder + ?Sized),
-) -> Result<(), TessellationError> {
-    if rectangle.far_left == join.side_points[SIDE_POSITIVE].prev
-        && rectangle.far_right == join.side_points[SIDE_NEGATIVE].prev
-    {
-        return Ok(());
-    }
-
-    vertex.position_on_path = join.position;
-    vertex.half_width = join.half_width;
-    vertex.side = Side::Positive;
-    vertex.normal = (rectangle.far_left - join.position) / join.half_width;
-    let far_left_vertex = output.add_stroke_vertex(StrokeVertex(vertex, attributes))?;
-    vertex.side = Side::Negative;
-    vertex.normal = (rectangle.far_right - join.position) / join.half_width;
-    let far_right_vertex = output.add_stroke_vertex(StrokeVertex(vertex, attributes))?;
-
-    let near_left_vertex = join.side_points[SIDE_POSITIVE].prev_vertex;
-    let near_right_vertex = join.side_points[SIDE_NEGATIVE].prev_vertex;
-    output.add_triangle(near_left_vertex, far_left_vertex, far_right_vertex);
-    output.add_triangle(near_left_vertex, far_right_vertex, near_right_vertex);
-    Ok(())
-}
-
-/// Fill between unchanged segment attachments and a pair of clipped join edges.
-fn emit_clipped_join(
-    join: &EndpointData,
-    [incoming, outgoing]: [Point; 2],
-    outer_side: usize,
-    vertex: &mut StrokeVertexData,
-    attributes: &dyn AttributeStore,
-    output: &mut (impl StrokeGeometryBuilder + ?Sized),
-) -> Result<bool, TessellationError> {
-    let inner_side = 1 - outer_side;
-    if join.side_points[inner_side].single_vertex.is_none()
-        || join.fold[outer_side]
-        || join.fold[inner_side]
-    {
-        return Ok(false);
-    }
-
-    vertex.position_on_path = join.position;
-    vertex.half_width = join.half_width;
-    vertex.side = if outer_side == SIDE_POSITIVE {
-        Side::Positive
-    } else {
-        Side::Negative
-    };
-
-    vertex.normal = (incoming - join.position) / join.half_width;
-    let incoming_clip_vertex = output.add_stroke_vertex(StrokeVertex(vertex, attributes))?;
-    let outgoing_clip_vertex = if outgoing == incoming {
-        incoming_clip_vertex
-    } else {
-        vertex.normal = (outgoing - join.position) / join.half_width;
-        output.add_stroke_vertex(StrokeVertex(vertex, attributes))?
-    };
-
-    let inner_vertex = join.side_points[inner_side].prev_vertex;
-    let incoming_outer_vertex = join.side_points[outer_side].prev_vertex;
-    let outgoing_outer_vertex = join.side_points[outer_side].next_vertex;
-    match outer_side {
-        SIDE_NEGATIVE => {
-            output.add_triangle(inner_vertex, outgoing_outer_vertex, outgoing_clip_vertex);
-            if outgoing_clip_vertex != incoming_clip_vertex {
-                output.add_triangle(inner_vertex, outgoing_clip_vertex, incoming_clip_vertex);
-            }
-            output.add_triangle(inner_vertex, incoming_clip_vertex, incoming_outer_vertex);
-        }
-        _ => {
-            output.add_triangle(inner_vertex, incoming_outer_vertex, incoming_clip_vertex);
-            if incoming_clip_vertex != outgoing_clip_vertex {
-                output.add_triangle(inner_vertex, incoming_clip_vertex, outgoing_clip_vertex);
-            }
-            output.add_triangle(inner_vertex, outgoing_clip_vertex, outgoing_outer_vertex);
-        }
-    }
-
-    Ok(true)
-}
-
-/// Find each cut on its radial edge or its straight support, as appropriate.
-fn subunit_miter_clip(
-    join: &EndpointData,
-    side: usize,
-    limit: f32,
-) -> Option<([Point; 2], [Vector64; 2])> {
-    let offsets = [
-        join.side_points[side].prev - join.position,
-        join.side_points[side].next - join.position,
-    ];
-    let bisector = (offsets[0] + offsets[1]).try_normalize()?;
-    let distance = limit * join.half_width;
-    let (incoming, outgoing) = get_clip_intersections(offsets[0], offsets[1], bisector, distance);
-    let mut cuts = [incoming, outgoing];
-    let mut tangents = [Vector64::new(0.0, 0.0); 2];
-    for i in 0..2 {
-        let projection = offsets[i].dot(bisector);
-        if projection > distance {
-            cuts[i] = offsets[i] * (distance / projection);
-            tangents[i] = round_clip::vector64(offsets[i]);
-        } else {
-            tangents[i] = round_clip::vector64(cuts[i] - offsets[i]);
-        }
-    }
-    Some((cuts.map(|offset| join.position + offset), tangents))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_mixed_arcs_clip(
-    join: &EndpointData,
-    resolved: &ResolvedArcsJoin,
-    options: &StrokeOptions,
-    mesh: &mut ArcsMesh,
-    vertex_ids: &mut Vec<VertexId>,
-    vertex: &mut StrokeVertexData,
-    attributes: &dyn AttributeStore,
-    output: &mut (impl StrokeGeometryBuilder + ?Sized),
-) -> Result<bool, TessellationError> {
-    let side = arcs_outer_side(resolved.turn());
-    let inner_side = 1 - side;
-    let Some(inner_position) = join.side_points[inner_side].single_vertex else {
-        return Ok(false);
-    };
-    if join.fold[side] || join.fold[inner_side] {
-        return Ok(false);
-    }
-    if mesh
-        .tessellate_with_inner_vertex(
-            resolved,
-            f64::from(options.tolerance),
-            Point64::new(f64::from(inner_position.x), f64::from(inner_position.y)),
-        )
-        .is_err()
-    {
-        return Ok(false);
-    }
-
-    // The contour ends with the existing outgoing attachment and inner vertex.
-    // Validate before emitting anything so a failed conversion can fall back.
-    let vertices = mesh.vertices();
-    let middle = &vertices[1..vertices.len() - 2];
-    for p in middle {
-        if point64_to_point(*p).is_err() {
-            return Ok(false);
-        }
-    }
-    vertex_ids.clear();
-    vertex_ids.reserve(vertices.len());
-    vertex_ids.push(join.side_points[side].prev_vertex);
-    vertex.position_on_path = join.position;
-    vertex.half_width = join.half_width;
-    vertex.side = if side == SIDE_POSITIVE {
-        Side::Positive
-    } else {
-        Side::Negative
-    };
-    for p in middle {
-        vertex.normal = (point(p.x as f32, p.y as f32) - join.position) / join.half_width;
-        vertex_ids.push(output.add_stroke_vertex(StrokeVertex(vertex, attributes))?);
-    }
-    vertex_ids.push(join.side_points[side].next_vertex);
-    vertex_ids.push(join.side_points[inner_side].prev_vertex);
-    for triangle in mesh.indices().chunks_exact(3) {
-        output.add_triangle(
-            vertex_ids[triangle[0]],
-            vertex_ids[triangle[2]],
-            vertex_ids[triangle[1]],
-        );
-    }
-    Ok(true)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_arcs_join(
-    join: &EndpointData,
-    resolved: &ResolvedArcsJoin,
-    side: usize,
-    options: &StrokeOptions,
-    mesh: &mut ArcsMesh,
-    vertex_ids: &mut Vec<VertexId>,
-    vertex: &mut StrokeVertexData,
-    attributes: &dyn AttributeStore,
-    output: &mut (impl StrokeGeometryBuilder + ?Sized),
-) -> Result<bool, TessellationError> {
-    if resolved.clips_radial_edge() {
-        // Mixed clips need the full inner contour, handled before bevel fill.
-        return Ok(false);
-    }
-    let tessellation = match mesh.tessellate_for_output(resolved, f64::from(options.tolerance)) {
-        Ok(tessellation) => tessellation,
-        Err(_) => return Ok(false),
-    };
-
-    match tessellation {
-        ArcsOutput::Triangle(triangle) => {
-            let Ok(position) = point64_to_point(triangle.middle) else {
-                return Ok(false);
-            };
-            if position == join.position {
-                return Ok(false);
-            }
-
-            vertex.position_on_path = join.position;
-            vertex.half_width = join.half_width;
-            vertex.side = if side == SIDE_POSITIVE {
-                Side::Positive
-            } else {
-                Side::Negative
-            };
-            vertex.normal = (position - join.position) / join.half_width;
-            let middle_vertex = output.add_stroke_vertex(StrokeVertex(vertex, attributes))?;
-            let vertex_ids = [
-                join.side_points[side].prev_vertex,
-                middle_vertex,
-                join.side_points[side].next_vertex,
-            ];
-            output.add_triangle(
-                vertex_ids[triangle.indices[0]],
-                vertex_ids[triangle.indices[2]],
-                vertex_ids[triangle.indices[1]],
-            );
-            Ok(true)
-        }
-        ArcsOutput::Quad(quad) => {
-            let Ok(first_position) = point64_to_point(quad.middle[0]) else {
-                return Ok(false);
-            };
-            let Ok(second_position) = point64_to_point(quad.middle[1]) else {
-                return Ok(false);
-            };
-            if first_position == join.position || second_position == join.position {
-                return Ok(false);
-            }
-
-            vertex.position_on_path = join.position;
-            vertex.half_width = join.half_width;
-            vertex.side = if side == SIDE_POSITIVE {
-                Side::Positive
-            } else {
-                Side::Negative
-            };
-            vertex.normal = (first_position - join.position) / join.half_width;
-            let first_middle = output.add_stroke_vertex(StrokeVertex(vertex, attributes))?;
-            vertex.normal = (second_position - join.position) / join.half_width;
-            let second_middle = output.add_stroke_vertex(StrokeVertex(vertex, attributes))?;
-            let vertex_ids = [
-                join.side_points[side].prev_vertex,
-                first_middle,
-                second_middle,
-                join.side_points[side].next_vertex,
-            ];
-            for triangle in quad.indices.chunks_exact(3) {
-                output.add_triangle(
-                    vertex_ids[usize::from(triangle[0])],
-                    vertex_ids[usize::from(triangle[2])],
-                    vertex_ids[usize::from(triangle[1])],
-                );
-            }
-            Ok(true)
-        }
-        ArcsOutput::Fan { vertices, fan } => emit_arcs_mesh_output(
-            join,
-            side,
-            vertices,
-            Some(fan),
-            &[],
-            vertex_ids,
-            vertex,
-            attributes,
-            output,
-        ),
-        ArcsOutput::Mesh { vertices, indices } => emit_arcs_mesh_output(
-            join, side, vertices, None, indices, vertex_ids, vertex, attributes, output,
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_arcs_mesh_output(
-    join: &EndpointData,
-    side: usize,
-    vertices: &[Point64],
-    fan: Option<ValidatedFan>,
-    indices: &[usize],
-    vertex_ids: &mut Vec<VertexId>,
-    vertex: &mut StrokeVertexData,
-    attributes: &dyn AttributeStore,
-    output: &mut (impl StrokeGeometryBuilder + ?Sized),
-) -> Result<bool, TessellationError> {
-    if vertices.len() < 3 {
-        return Ok(false);
-    }
-
-    for point64 in &vertices[1..vertices.len() - 1] {
-        let Ok(position) = point64_to_point(*point64) else {
-            return Ok(false);
-        };
-        if position == join.position {
-            return Ok(false);
-        }
-    }
-
-    vertex_ids.clear();
-    vertex_ids.reserve(vertices.len());
-    vertex_ids.push(join.side_points[side].prev_vertex);
-
-    vertex.position_on_path = join.position;
-    vertex.half_width = join.half_width;
-    vertex.side = if side == SIDE_POSITIVE {
-        Side::Positive
-    } else {
-        Side::Negative
-    };
-    for point64 in &vertices[1..vertices.len() - 1] {
-        // The preflight above checked both components against the f32 range.
-        let position = point(point64.x as f32, point64.y as f32);
-        vertex.normal = (position - join.position) / join.half_width;
-        vertex_ids.push(output.add_stroke_vertex(StrokeVertex(vertex, attributes))?);
-    }
-    vertex_ids.push(join.side_points[side].next_vertex);
-
-    if let Some(fan) = fan {
-        for [first, second, third] in fan.triangles() {
-            output.add_triangle(vertex_ids[first], vertex_ids[third], vertex_ids[second]);
-        }
-    } else {
-        for triangle in indices.chunks_exact(3) {
-            output.add_triangle(
-                vertex_ids[triangle[0]],
-                vertex_ids[triangle[2]],
-                vertex_ids[triangle[1]],
-            );
-        }
-    }
-
-    Ok(true)
-}
-
+#[inline(always)]
 fn tessellate_round_join(
     join: &mut EndpointData,
     side: usize,
@@ -4060,30 +3074,6 @@ fn cubic_differentials_preserve_signed_endpoint_curvature() {
 }
 
 #[test]
-fn arcs_join_resolves_endpoint_differentials_into_support_geometry() {
-    let join = EndpointData {
-        position: point(10.0, 5.0),
-        half_width: 2.0,
-        line_join: LineJoin::Arcs,
-        ..EndpointData::default()
-    };
-    let differentials = EndpointDifferentials {
-        incoming: EndpointDifferential::Regular {
-            unit_tangent: vector(1.0, 0.0),
-            curvature: 0.0,
-        },
-        outgoing: EndpointDifferential::Regular {
-            unit_tangent: vector(0.0, 1.0),
-            curvature: 0.1,
-        },
-    };
-
-    let resolution = resolve_arcs_join(&join, differentials, &StrokeOptions::default());
-
-    assert!(matches!(resolution, Ok(JoinConstruction::Arcs(_))));
-}
-
-#[test]
 fn arcs_join_emits_a_different_mesh_than_round_for_both_turn_directions() {
     let options = StrokeOptions::default()
         .with_line_width(4.0)
@@ -4225,8 +3215,8 @@ fn arcs_join_emits_radial_clips_for_sub_unit_miter_limits() {
         let JoinConstruction::RadialClip(expected) = expected else {
             panic!("the sub-unit miter limit should select a radial clip");
         };
-        let expected_incoming = point64_to_point(expected.incoming).expect("finite clip point");
-        let expected_outgoing = point64_to_point(expected.outgoing).expect("finite clip point");
+        let expected_incoming = point(expected.incoming.x as f32, expected.incoming.y as f32);
+        let expected_outgoing = point(expected.outgoing.x as f32, expected.outgoing.y as f32);
         let mut buffers: VertexBuffers<Point, u16> = VertexBuffers::new();
 
         StrokeTessellator::new()
@@ -4333,44 +3323,6 @@ fn arcs_join_supports_a_zero_miter_limit() {
 
         test_path(path.as_slice(), &options, None);
     }
-}
-
-#[test]
-fn arcs_join_keeps_explicit_svg_fallback_states() {
-    let mut join = EndpointData {
-        half_width: 2.0,
-        line_join: LineJoin::Arcs,
-        ..EndpointData::default()
-    };
-    let line_differentials = EndpointDifferentials {
-        incoming: EndpointDifferential::Regular {
-            unit_tangent: vector(1.0, 0.0),
-            curvature: 0.0,
-        },
-        outgoing: EndpointDifferential::Regular {
-            unit_tangent: vector(0.0, 1.0),
-            curvature: 0.0,
-        },
-    };
-
-    let options = StrokeOptions::default();
-    let line_join = resolve_arcs_join(&join, line_differentials, &options);
-    let line_geometry = prepare_arcs_join(&mut join, line_differentials, &options);
-    let applied_line_fallback = join.line_join;
-    join.line_join = LineJoin::Arcs;
-    let degenerate_differentials = EndpointDifferentials {
-        outgoing: EndpointDifferential::Degenerate,
-        ..line_differentials
-    };
-    let degenerate_join = resolve_arcs_join(&join, degenerate_differentials, &options);
-    let degenerate_geometry = prepare_arcs_join(&mut join, degenerate_differentials, &options);
-
-    assert!(matches!(line_join, Ok(JoinConstruction::MiterClip)));
-    assert!(line_geometry.is_none());
-    assert_eq!(applied_line_fallback, LineJoin::MiterClip);
-    assert!(degenerate_join.is_err());
-    assert!(degenerate_geometry.is_none());
-    assert_eq!(join.line_join, LineJoin::Round);
 }
 
 #[test]
@@ -4859,11 +3811,13 @@ fn issue_959() {
             .with_line_join(LineJoin::Round);
 
         let mut mesh: VertexBuffers<Point, u32> = VertexBuffers::new();
-        tessellator.tessellate_path(
-            &path,
-            &options,
-            &mut BuffersBuilder::new(&mut mesh, |v: StrokeVertex| v.position()),
-        ).unwrap();
+        tessellator
+            .tessellate_path(
+                &path,
+                &options,
+                &mut BuffersBuilder::new(&mut mesh, |v: StrokeVertex| v.position()),
+            )
+            .unwrap();
     }
 }
 
@@ -4893,7 +3847,9 @@ fn correct_miter_clip_length() {
         .tessellate_path(&path, &options, &mut builder)
         .unwrap();
 
-    let max_y = mesh.vertices.iter()
+    let max_y = mesh
+        .vertices
+        .iter()
         .map(|p| p.y)
         .reduce(|acc, y| acc.max(y))
         .unwrap();

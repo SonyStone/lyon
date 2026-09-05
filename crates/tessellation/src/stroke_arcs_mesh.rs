@@ -151,6 +151,7 @@ impl ArcsMesh {
         .map(|_| ())
     }
 
+    #[cfg(test)]
     pub(crate) fn tessellate(
         &mut self,
         join: &ResolvedArcsJoin,
@@ -278,6 +279,7 @@ impl ArcsMesh {
         }
     }
 
+    #[cfg(test)]
     fn tessellate_impl<
         const ALLOW_FAN: bool,
         const RECURRENT_ROTATION: bool,
@@ -299,6 +301,7 @@ impl ArcsMesh {
         self.remaining.clear();
     }
 
+    #[cfg(test)]
     fn tessellate_layout<
         const ALLOW_FAN: bool,
         const RECURRENT_ROTATION: bool,
@@ -480,6 +483,7 @@ impl fmt::Display for ArcsMeshError {
 /// subdivision that would exceed the module's safety limit, or a boundary
 /// which does not form a triangulatable simple polygon.
 #[must_use = "the generated join mesh must be handled"]
+#[cfg(test)]
 pub(crate) fn tessellate_arcs_join(
     join: &ResolvedArcsJoin,
     tolerance: f64,

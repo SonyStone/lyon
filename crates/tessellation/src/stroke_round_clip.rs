@@ -21,13 +21,7 @@ pub(super) fn emit(
     let Some(cap) = RoundClip::new(join.position, ends, tangents, tolerance)? else {
         return Ok(());
     };
-    vertex.position_on_path = join.position;
-    vertex.half_width = join.half_width;
-    vertex.side = if side == SIDE_POSITIVE {
-        Side::Positive
-    } else {
-        Side::Negative
-    };
+    set_join_vertex_metadata(join, side, vertex);
     let center = emit_point(cap.center, vertex, attributes, output)?;
     let mut previous = emit_point(cap.arcs[0].start, vertex, attributes, output)?;
     for step in 1..=cap.steps() {
