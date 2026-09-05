@@ -1430,6 +1430,11 @@ impl<'l> StrokeBuilderImpl<'l> {
                 let n = vector(-tangent.y, tangent.x) * p1.half_width;
                 p1.side_points[SIDE_POSITIVE].prev = p1.position + n;
                 p1.side_points[SIDE_NEGATIVE].prev = p1.position - n;
+            } else if p1.is_flattening_step {
+                // The curve endpoint may have been merged with the last sample,
+                // whose incoming attachments were deferred by the fast path.
+                let mut incoming = p0;
+                compute_edge_attachment_positions(&mut incoming, &mut p1);
             }
 
             let is_first = count == 2;
@@ -1529,6 +1534,13 @@ impl<'l> StrokeBuilderImpl<'l> {
                     self.output,
                 )?;
             } else {
+                if join.is_flattening_step {
+                    // A sharp turn between flattened samples needs the full join
+                    // attachments. Preserve the previous sample's emitted geometry.
+                    let mut incoming = *prev;
+                    compute_edge_attachment_positions(&mut incoming, join);
+                    compute_edge_attachment_positions(join, &mut next);
+                }
                 joins::tessellate_endpoint_join::<false>(
                     join,
                     [prev, &next],
@@ -2092,14 +2104,20 @@ fn compute_join_side_positions(
     nan_check!(join.side_points[side].next);
 
     let sign = side_sign(side);
-    let v0 = (join.side_points[side].prev - prev.side_points[side].next).normalize();
-    let v1 = (next.side_points[side].prev - join.side_points[side].next).normalize();
+    let path_v0 = (join.position - prev.position).normalize();
+    let path_v1 = (next.position - join.position).normalize();
+    // Offset endpoints can coincide even when the path endpoints are distinct,
+    // for example when a taper collapses an edge or f32 rounding merges it.
+    let v0 = (join.side_points[side].prev - prev.side_points[side].next)
+        .try_normalize()
+        .unwrap_or(path_v0);
+    let v1 = (next.side_points[side].prev - join.side_points[side].next)
+        .try_normalize()
+        .unwrap_or(path_v1);
     let inward = v0.cross(v1) * sign > 0.0;
     let forward = v0.dot(v1) > 0.0;
 
     let normal = compute_normal(v0, v1) * sign;
-    let path_v0 = (join.position - prev.position).normalize();
-    let path_v1 = (next.position - join.position).normalize();
 
     nan_check!(v0, v1);
 

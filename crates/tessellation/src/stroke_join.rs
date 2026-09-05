@@ -1,4 +1,4 @@
-//! Prepares and emits original endpoint joins, including attachment and fallback policy.
+//! Prepares and emits endpoint joins and sharp turns between flattened samples.
 //! The path walker supplies neighbors and derivatives; mesh topology stays here.
 
 use super::*;
@@ -95,7 +95,7 @@ struct PreparedRadialClip {
     outgoing: Point,
 }
 
-/// Process one original endpoint; flattened points bypass this function entirely.
+/// Process an original endpoint or a flattened sample that needs a full join.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn tessellate_endpoint_join<const FIXED_WIDTH: bool>(
     join: &mut EndpointData,
