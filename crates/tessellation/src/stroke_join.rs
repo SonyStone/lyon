@@ -324,6 +324,9 @@ fn align_arcs_side_points(
             join.side_points[side].prev = incoming;
             join.side_points[side].next = outgoing;
             join.side_points[side].single_vertex = None;
+            // The resolved outer boundary replaces the folded join. Retain
+            // each segment's cross-section for the edge triangles.
+            join.fold = [false, false];
         }
         PreparedArcsJoin::ParallelRectangle(rectangle) => {
             join.side_points[SIDE_POSITIVE].prev = rectangle.near_left;
@@ -339,6 +342,10 @@ fn align_arcs_side_points(
             join.side_points[side].prev = radial_clip.incoming_offset_point;
             join.side_points[side].next = radial_clip.outgoing_offset_point;
             join.side_points[side].single_vertex = None;
+            // The clip uses a bounded center fan when the inner miter is
+            // absent. Keep both segment cross-sections instead of swapping
+            // their vertices through the folding topology.
+            join.fold = [false, false];
         }
     }
     Ok(())
@@ -405,32 +412,31 @@ fn tessellate_join<const EXTENDED: bool>(
         }
 
         if let Some(PreparedArcsJoin::RadialClip(radial_clip)) = arcs_join {
-            if emit_clipped_join(
+            emit_clipped_join(
                 join,
                 [radial_clip.incoming, radial_clip.outgoing],
                 arcs_outer_side(radial_clip.turn),
                 vertex,
                 attributes,
                 output,
-            )? {
-                if requested_join == LineJoin::ArcsRound {
-                    round_clip::emit(
-                        join,
-                        [radial_clip.incoming, radial_clip.outgoing],
-                        [
-                            radial_clip.incoming - join.position,
-                            radial_clip.outgoing - join.position,
-                        ]
-                        .map(round_clip::vector64),
-                        arcs_outer_side(radial_clip.turn),
-                        options.tolerance,
-                        vertex,
-                        attributes,
-                        output,
-                    )?;
-                }
-                return Ok(());
+            )?;
+            if requested_join == LineJoin::ArcsRound {
+                round_clip::emit(
+                    join,
+                    [radial_clip.incoming, radial_clip.outgoing],
+                    [
+                        radial_clip.incoming - join.position,
+                        radial_clip.outgoing - join.position,
+                    ]
+                    .map(round_clip::vector64),
+                    arcs_outer_side(radial_clip.turn),
+                    options.tolerance,
+                    vertex,
+                    attributes,
+                    output,
+                )?;
             }
+            return Ok(());
         }
 
         if let Some(PreparedArcsJoin::Curved(resolved)) = arcs_join {
@@ -471,27 +477,30 @@ fn tessellate_join<const EXTENDED: bool>(
         // attachments intact and emit the retained join separately instead of
         // extending the clipping line backwards into the segment bodies.
         if join.line_join == LineJoin::MiterClip && options.miter_limit < 1.0 {
-            for side in 0..2 {
-                if join.side_points[side].single_vertex.is_some() {
-                    continue;
-                }
+            let incoming = join.position - neighbors[0].position;
+            let outgoing = neighbors[1].position - join.position;
+            let side = if incoming.cross(outgoing) >= 0.0 {
+                SIDE_NEGATIVE
+            } else {
+                SIDE_POSITIVE
+            };
+            if join.side_points[side].single_vertex.is_none() {
                 if let Some((ends, tangents)) = subunit_miter_clip(join, side, options.miter_limit)
                 {
-                    if emit_clipped_join(join, ends, side, vertex, attributes, output)? {
-                        if requested_join == LineJoin::ArcsRound {
-                            round_clip::emit(
-                                join,
-                                ends,
-                                tangents,
-                                side,
-                                options.tolerance,
-                                vertex,
-                                attributes,
-                                output,
-                            )?;
-                        }
-                        return Ok(());
+                    emit_clipped_join(join, ends, side, vertex, attributes, output)?;
+                    if requested_join == LineJoin::ArcsRound {
+                        round_clip::emit(
+                            join,
+                            ends,
+                            tangents,
+                            side,
+                            options.tolerance,
+                            vertex,
+                            attributes,
+                            output,
+                        )?;
                     }
+                    return Ok(());
                 }
             }
         }
@@ -648,14 +657,11 @@ fn emit_clipped_join(
     vertex: &mut StrokeVertexData,
     attributes: &dyn AttributeStore,
     output: &mut (impl StrokeGeometryBuilder + ?Sized),
-) -> Result<bool, TessellationError> {
+) -> Result<(), TessellationError> {
     let inner_side = 1 - outer_side;
-    if join.side_points[inner_side].single_vertex.is_none()
+    let center_anchor = join.side_points[inner_side].single_vertex.is_none()
         || join.fold[outer_side]
-        || join.fold[inner_side]
-    {
-        return Ok(false);
-    }
+        || join.fold[inner_side];
 
     vertex.position_on_path = join.position;
     vertex.half_width = join.half_width;
@@ -674,7 +680,15 @@ fn emit_clipped_join(
         output.add_stroke_vertex(StrokeVertex(vertex, attributes))?
     };
 
-    let inner_vertex = join.side_points[inner_side].prev_vertex;
+    let inner_vertex = if center_anchor {
+        // Folding removes the inner miter to avoid a spike beyond a short
+        // flattened edge. The path point still anchors the retained clip;
+        // its position does not depend on the curve's subdivision direction.
+        vertex.normal = Vector::zero();
+        output.add_stroke_vertex(StrokeVertex(vertex, attributes))?
+    } else {
+        join.side_points[inner_side].prev_vertex
+    };
     let incoming_outer_vertex = join.side_points[outer_side].prev_vertex;
     let outgoing_outer_vertex = join.side_points[outer_side].next_vertex;
     match outer_side {
@@ -694,7 +708,7 @@ fn emit_clipped_join(
         }
     }
 
-    Ok(true)
+    Ok(())
 }
 
 /// Find each cut on its radial edge or its straight support, as appropriate.
@@ -747,11 +761,9 @@ fn emit_mixed_arcs_clip(
 ) -> Result<JoinEmission, TessellationError> {
     let side = arcs_outer_side(resolved.turn());
     let inner_side = 1 - side;
-    let Some(inner_position) = join.side_points[inner_side].single_vertex else {
-        return Ok(JoinEmission::Fallback(
-            ArcsJoinFallback::IncompatibleAttachments,
-        ));
-    };
+    let inner_position = join.side_points[inner_side]
+        .single_vertex
+        .unwrap_or(join.position);
     if join.fold[side] || join.fold[inner_side] {
         return Ok(JoinEmission::Fallback(
             ArcsJoinFallback::IncompatibleAttachments,
@@ -765,7 +777,7 @@ fn emit_mixed_arcs_clip(
         return Ok(JoinEmission::Fallback(ArcsJoinFallback::Mesh(error)));
     }
 
-    // The contour ends with the existing outgoing attachment and inner vertex.
+    // The contour ends with the outgoing attachment and inner miter or center.
     // Validate before emitting anything so a failed conversion can fall back.
     let vertices = mesh.vertices();
     let middle = &vertices[1..vertices.len() - 2];
@@ -783,7 +795,13 @@ fn emit_mixed_arcs_clip(
         vertex_ids.push(output.add_stroke_vertex(StrokeVertex(vertex, attributes))?);
     }
     vertex_ids.push(join.side_points[side].next_vertex);
-    vertex_ids.push(join.side_points[inner_side].prev_vertex);
+    let inner_vertex = if join.side_points[inner_side].single_vertex.is_some() {
+        join.side_points[inner_side].prev_vertex
+    } else {
+        vertex.normal = Vector::zero();
+        output.add_stroke_vertex(StrokeVertex(vertex, attributes))?
+    };
+    vertex_ids.push(inner_vertex);
     for triangle in mesh.indices().chunks_exact(3) {
         output.add_triangle(
             vertex_ids[triangle[0]],

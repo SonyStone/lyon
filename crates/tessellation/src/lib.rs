@@ -350,6 +350,8 @@ pub struct StrokeOptions {
     /// See the SVG specification.
     ///
     /// Must be greater than or equal to 0.0.
+    /// Positive infinity disables clipping. Arcs joins with opposite tangents
+    /// use a round fallback when this would require an unbounded join.
     /// Default value: `StrokeOptions::DEFAULT_MITER_LIMIT`.
     pub miter_limit: f32,
 
@@ -431,6 +433,7 @@ impl StrokeOptions {
     ///
     /// This range applies regardless of the current join, so the order of
     /// [`Self::with_line_join`] and this method does not matter.
+    /// Positive infinity disables clipping; unbounded Arcs reversals use Round.
     ///
     /// # Panics
     ///

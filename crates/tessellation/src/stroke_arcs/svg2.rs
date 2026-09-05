@@ -12,6 +12,9 @@ pub(crate) fn construct_svg2(input: JoinInput) -> Result<JoinConstruction, JoinE
     if cross.abs() <= PARALLEL_EPSILON && dot > 0.0 {
         return Ok(JoinConstruction::Empty);
     }
+    if cross.abs() <= PARALLEL_EPSILON && dot < 0.0 && input.miter_limit == f64::INFINITY {
+        return Err(JoinErrorKind::UnboundedParallelJoin.into());
+    }
     if input.incoming.curvature == 0.0 && input.outgoing.curvature == 0.0 {
         return Ok(JoinConstruction::MiterClip);
     }

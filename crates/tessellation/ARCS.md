@@ -18,6 +18,9 @@ publication.
 output-builder dispatch. The default join remains `Miter`. The miter-limit setter
 now accepts zero and subunit values for every style, independently of setter
 order. `MINIMUM_MITER_LIMIT` remains the legacy value of one for existing callers.
+Positive infinity disables miter clipping. Opposite endpoint tangents with an
+infinite limit have no finite Arcs join and use the Round fallback. A zero limit
+keeps the cut exactly at the join point, without adding a rounding artifact.
 
 ArcsRound is a Lyon extension. Its tip can extend beyond the miter limit, and
 invalid or non-convex biarc fits retain the flat cut. Line caps are independent.
@@ -53,6 +56,13 @@ fill. The adapter therefore handles them before the shared join interior. Local
 mesh indices referring to incoming, outgoing and inner attachment vertices never
 escape into the path walker. Existing vertex insertion order and metadata are
 preserved by this refactoring.
+
+Resolved Arcs boundaries retain the segment cross-sections instead of the
+legacy folded vertex mapping. For radial and mixed cuts, the path point replaces
+a missing inner miter as the triangulation root. A collinear final remainder
+does not discard a mesh whose positive-area ears have already been emitted.
+This keeps the cut and its ArcsRound tip independent of which short flattened
+edge triggered folding, including on reversed and variable-width curves.
 
 ## Why disabled Arcs can affect performance
 
@@ -104,6 +114,13 @@ closed paths, style changes and tessellator reuse. Additional tests cover
 history wraparound, replaced flattening points, explicit and implicit closure,
 disabled derivative evaluation, typed fallback selection and failures at every
 output vertex insertion.
+
+`tests/arcs_invariants.rs` checks finite geometry and vertex metadata before
+comparing coverage. It covers reversed/reflected/translated paths, radial cuts
+with folding, all caps, variable widths, zero and infinite miter limits, and
+preservation of segment bodies. Coverage comparisons exclude a small band around
+mesh edges to allow for flattening and f32 translation error. These are finite
+regression corpora, not proof of correctness for every path.
 
 The unchanged legacy benchmarks are:
 

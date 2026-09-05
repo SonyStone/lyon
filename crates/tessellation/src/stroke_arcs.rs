@@ -509,7 +509,10 @@ impl fmt::Display for JoinError {
                 formatter.write_str("half width must be finite and greater than zero")
             }
             JoinErrorKind::InvalidMiterLimit => {
-                formatter.write_str("miter limit must be finite and non-negative")
+                formatter.write_str("miter limit must be non-negative and not NaN")
+            }
+            JoinErrorKind::UnboundedParallelJoin => {
+                formatter.write_str("opposite tangents with an infinite limit have no finite join")
             }
             JoinErrorKind::CollinearTangents => {
                 formatter.write_str("collinear tangents do not define an outer side")
@@ -538,6 +541,7 @@ enum JoinErrorKind {
     NonFiniteCurvature { segment: &'static str },
     InvalidHalfWidth,
     InvalidMiterLimit,
+    UnboundedParallelJoin,
     CollinearTangents,
     NoUniqueIntersection,
     CollapsedOffsetCircle { segment: &'static str },
@@ -696,7 +700,7 @@ fn validate_input(input: JoinInput) -> Result<(), JoinError> {
     if !input.half_width.is_finite() || input.half_width <= 0.0 {
         return Err(JoinErrorKind::InvalidHalfWidth.into());
     }
-    if !input.miter_limit.is_finite() || input.miter_limit < 0.0 {
+    if input.miter_limit.is_nan() || input.miter_limit < 0.0 {
         return Err(JoinErrorKind::InvalidMiterLimit.into());
     }
 
@@ -952,6 +956,9 @@ fn miter_clip_line<const EARLY_ACCEPT: bool>(
     intersection: Point64,
     limit: f64,
 ) -> Option<ClipLine> {
+    if limit == f64::INFINITY {
+        return None;
+    }
     let bisector_vector = (incoming_offset_point - at) + (outgoing_offset_point - at);
     let to_intersection = intersection - at;
 
@@ -960,6 +967,14 @@ fn miter_clip_line<const EARLY_ACCEPT: bool>(
     }
     let bisector = normalized(bisector_vector)?;
     let normal = bisector.left_normal();
+    if limit == 0.0 {
+        // Sampling the auxiliary circle at angle zero can round away from at.
+        // Keep the collapsed cut exact so it cannot acquire a rounded tip.
+        return Some(ClipLine {
+            point: at,
+            direction: normal,
+        });
+    }
     let denominator = 2.0 * to_intersection.dot(normal);
     let scale = to_intersection.x.hypot(to_intersection.y).max(1.0);
 
@@ -1579,7 +1594,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "miter limit must be finite and non-negative"
+            "miter limit must be non-negative and not NaN"
         );
     }
 

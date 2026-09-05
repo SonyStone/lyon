@@ -908,12 +908,16 @@ fn triangulate_with_ear_clipping(
     let [first, second, third] = remaining[..] else {
         return Err(ArcsMeshError::NonTriangulatableBoundary);
     };
-    if signed_triangle_area(vertices[first], vertices[second], vertices[third])
-        <= triangle_epsilon(vertices[first], vertices[second], vertices[third])
-    {
+    let area = signed_triangle_area(vertices[first], vertices[second], vertices[third]);
+    let epsilon = triangle_epsilon(vertices[first], vertices[second], vertices[third]);
+    if area < -epsilon || (area <= epsilon && indices.is_empty()) {
         return Err(ArcsMeshError::NonTriangulatableBoundary);
     }
-    push_triangle(indices, first, second, third);
+    // A radial cut can leave a collinear spur after all positive-area ears
+    // have been emitted. It adds no coverage and must not discard that mesh.
+    if area > epsilon {
+        push_triangle(indices, first, second, third);
+    }
     Ok(TriangulationMethod::EarClipping)
 }
 
@@ -1627,5 +1631,40 @@ mod tests {
     fn point_is_near(actual: Point64, expected: Point64) -> bool {
         (actual.x - expected.x).abs() <= TEST_EPSILON
             && (actual.y - expected.y).abs() <= TEST_EPSILON
+    }
+
+    #[test]
+    fn collinear_final_spur_preserves_completed_ears() {
+        let polygon = [
+            Point64::new(0.0, 0.0),
+            Point64::new(2.0, 0.0),
+            Point64::new(1.0, 0.0),
+            Point64::new(1.0, 1.0),
+            Point64::new(0.0, 1.0),
+        ];
+        for reverse in [false, true] {
+            let mut vertices = polygon;
+            if reverse {
+                vertices.reverse();
+            }
+            let mut indices = Vec::new();
+            triangulate_polygon(&mut indices, &vertices, &mut Vec::new(), &[]).unwrap();
+            let area: f64 = indices
+                .chunks_exact(3)
+                .map(|t| {
+                    let area = signed_triangle_area(vertices[t[0]], vertices[t[1]], vertices[t[2]]);
+                    assert!(area > 0.0);
+                    area
+                })
+                .sum();
+            assert!((area - 1.0).abs() < 1.0e-12);
+        }
+        let line = [
+            Point64::new(0.0, 0.0),
+            Point64::new(1.0, 0.0),
+            Point64::new(2.0, 0.0),
+            Point64::new(3.0, 0.0),
+        ];
+        assert!(triangulate_polygon(&mut Vec::new(), &line, &mut Vec::new(), &[]).is_err());
     }
 }
